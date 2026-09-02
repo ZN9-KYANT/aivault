@@ -2,6 +2,9 @@
 package config
 
 import (
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -25,10 +28,10 @@ type Admin struct {
 // Config mirrors config.toml.
 type Config struct {
 	Server       Server     `toml:"server"`
-	AutoLockMins  int        `toml:"auto_lock_minutes"`
-	KDF           kdf.Params `toml:"kdf"`
-	Verifier      string     `toml:"verifier"` // hex-encoded KEK-wrapped verifier blob (SPEC 4.1)
-	Admin         Admin      `toml:"admin"`
+	AutoLockMins int        `toml:"auto_lock_minutes"`
+	KDF          kdf.Params `toml:"kdf"`
+	Verifier     string     `toml:"verifier"` // hex-encoded KEK-wrapped verifier blob (SPEC 4.1)
+	Admin        Admin      `toml:"admin"`
 }
 
 // Default returns the default configuration (SPEC 4.2: 15-minute auto-lock;
@@ -54,6 +57,24 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// VerifyPassphrase confirms the master passphrase against the config.toml
+// verifier blob without decrypting any vault file (SPEC 4.1).
+func (c *Config) VerifyPassphrase(passphrase []byte) error {
+	if c.Verifier == "" {
+		return errors.New("config: vault not initialized (verifier missing)")
+	}
+	blob, err := hex.DecodeString(c.Verifier)
+	if err != nil {
+		return fmt.Errorf("config: verifier: %w", err)
+	}
+	kek, err := kdf.DeriveKEK(passphrase, &c.KDF)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	defer kdf.Zeroize(kek)
+	return kdf.UnwrapVerifier(kek, blob)
 }
 
 // Save atomically writes config.toml with 0600 permissions (SPEC 8.2).

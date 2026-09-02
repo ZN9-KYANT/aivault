@@ -3,9 +3,14 @@
 package audit
 
 import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
-
-	"github.com/ZN9-KYANT/aivault/internal/errs"
 )
 
 // Event names (SPEC 4.5).
@@ -27,8 +32,58 @@ type Entry struct {
 	Outcome    string    `json:"outcome"`
 }
 
-// Log appends one entry to the audit log at path (stub).
-func Log(path string, e Entry) error { return errs.ErrNotImplemented }
+// Log appends one entry to the audit log at path, creating it 0600 if needed.
+func Log(path string, e Entry) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("audit: %w", err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("audit: %w", err)
+	}
+	defer f.Close()
+	if e.Timestamp.IsZero() {
+		e.Timestamp = time.Now().UTC()
+	}
+	data, err := json.Marshal(e)
+	if err != nil {
+		return fmt.Errorf("audit: encode entry: %w", err)
+	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("audit: append: %w", err)
+	}
+	return nil
+}
 
-// Tail returns the last n entries from the audit log at path (stub).
-func Tail(path string, n int) ([]Entry, error) { return nil, errs.ErrNotImplemented }
+// Tail returns the last n entries from the audit log at path. A missing log
+// yields no entries.
+func Tail(path string, n int) ([]Entry, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("audit: %w", err)
+	}
+	defer f.Close()
+
+	var entries []Entry
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var e Entry
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			return nil, fmt.Errorf("audit: parse line %q: %w", sc.Text(), err)
+		}
+		entries = append(entries, e)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("audit: read: %w", err)
+	}
+	if len(entries) > n {
+		entries = entries[len(entries)-n:]
+	}
+	return entries, nil
+}

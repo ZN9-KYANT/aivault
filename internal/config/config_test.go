@@ -1,8 +1,12 @@
 package config
 
 import (
+	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"testing"
+
+	"github.com/ZN9-KYANT/aivault/internal/kdf"
 )
 
 func TestSaveLoadRoundTrip(t *testing.T) {
@@ -36,6 +40,38 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got.Verifier != "cafebabe" {
 		t.Errorf("verifier = %q, want cafebabe", got.Verifier)
+	}
+}
+
+func TestVerifyPassphrase(t *testing.T) {
+	params, err := kdf.NewParams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("zephyr-quartz-muffin-tundra-9")
+	kek, err := kdf.DeriveKEK(pass, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kdf.Zeroize(kek)
+	blob, err := kdf.WrapVerifier(kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	cfg.KDF = *params
+	cfg.Verifier = hex.EncodeToString(blob)
+
+	if err := cfg.VerifyPassphrase(pass); err != nil {
+		t.Errorf("correct passphrase rejected: %v", err)
+	}
+	err = cfg.VerifyPassphrase([]byte("wrong-passphrase-xyz-1"))
+	if !errors.Is(err, kdf.ErrWrongPassphrase) {
+		t.Errorf("wrong passphrase err = %v, want ErrWrongPassphrase", err)
+	}
+	if err := Default().VerifyPassphrase(pass); err == nil {
+		t.Error("uninitialized config should fail verification")
 	}
 }
 
