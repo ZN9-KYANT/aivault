@@ -15,3 +15,6 @@ coverage.*
 # OS cruft
 Thumbs.db
 .DS_Store
+
+# Session hand-off notes (local working state, not project docs)
+HANDOFF.md
