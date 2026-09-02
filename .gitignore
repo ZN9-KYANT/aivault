@@ -1,0 +1,17 @@
+# Binaries
+/aivault
+*.exe
+
+# Test / coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Vault safety net — never commit encrypted vault files or raw keys
+*.age
+*.key
+.env
+
+# OS cruft
+Thumbs.db
+.DS_Store
