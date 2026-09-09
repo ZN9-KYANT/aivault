@@ -101,11 +101,11 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		ConfigPath:   cfgPath,
 		SocketPath:   server.SocketPath(home),
 		Port:         cfg.Server.Port,
+		DataPlane:    true,
 		AutoLockMins: cfg.AutoLockMins,
 	}
 	fmt.Printf("aivault server: admin socket %s\n", opts.SocketPath)
 	fmt.Printf("auto-lock: %d min idle (0 disables)\n", opts.AutoLockMins)
-	fmt.Println("data plane: pending (proxy keys + /v1 endpoints — next milestone)")
 	return server.New(opts).Run()
 }
 

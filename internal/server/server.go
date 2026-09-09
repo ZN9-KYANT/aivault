@@ -31,7 +31,8 @@ type Options struct {
 	Home         string // aivault home: vault files + audit log
 	ConfigPath   string // config.toml (may be overridden by serve --config)
 	SocketPath   string // admin unix socket, e.g. ~/.aivault/aivault.sock
-	Port         int    // data-plane port, reserved for SPEC 6.1 (unused yet)
+	Port         int    // data-plane port, bound to 127.0.0.1 only (SPEC 6.1, 8.7)
+	DataPlane    bool   // serve the OpenAI-compatible /v1 data plane on Port
 	AutoLockMins int    // keyring auto-lock idle timeout; 0 disables (SPEC 4.2)
 }
 
@@ -52,8 +53,13 @@ type Server struct {
 
 	mu           sync.Mutex
 	httpSrv      *http.Server
+	dataSrv      *http.Server
 	autoLockMins int
 	lastActive   time.Time // last request that used the keyring (SPEC 4.2)
+
+	upstream    *http.Client            // provider requests (SPEC 6.1)
+	modelsMu    sync.Mutex
+	modelsCache map[string]modelsEntry // provider → cached /models (SPEC 5)
 }
 
 // New returns a Server with the given options.
@@ -63,23 +69,48 @@ func New(opts Options) *Server {
 		auditLog:     filepath.Join(opts.Home, "audit.log"),
 		ring:         keyring.New(),
 		autoLockMins: opts.AutoLockMins,
+		modelsCache:  make(map[string]modelsEntry),
+		upstream: &http.Client{
+			// No overall Timeout: streaming responses must stay open (SPEC 6.1).
+			// Non-streaming requests apply a context deadline instead.
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 120 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		},
 	}
 }
 
 // SocketPath returns the admin socket path under the aivault home (SPEC 4.3).
 func SocketPath(home string) string { return filepath.Join(home, "aivault.sock") }
 
-// Run blocks serving the admin plane until a signal or listener failure
-// (SPEC 4.2, 6.2): the keyring is zeroized and the socket removed on any
-// exit path. The data plane on Options.Port arrives with SPEC 6.1.
+// Run blocks serving the admin plane (unix socket) and — when enabled — the
+// OpenAI-compatible data plane on 127.0.0.1:Port (SPEC 4.2, 4.3, 6.1, 6.2):
+// the keyring is zeroized and sockets removed on any exit path.
 func (s *Server) Run() error {
 	ln, err := s.listen()
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.httpSrv = &http.Server{Handler: s.routes()}
+	s.httpSrv = &http.Server{Handler: s.adminRoutes()}
+	var dataLn net.Listener
+	if s.opts.DataPlane {
+		dataLn, err = s.listenData()
+		if err == nil {
+			s.dataSrv = &http.Server{Handler: s.dataRoutes()}
+		}
+	}
 	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if dataLn != nil {
+		fmt.Fprintf(os.Stderr, "data plane: http://%s (loopback only, SPEC 8.7)\n", dataLn.Addr())
+	}
 
 	// Idle auto-lock reaper (SPEC 4.2): cheap 1 s polling next to the
 	// minute-scale timeout.
@@ -98,12 +129,16 @@ func (s *Server) Run() error {
 		}
 	}()
 
-	errCh := make(chan error, 1)
-	go func() {
-		if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	errCh := make(chan error, 2)
+	serve := func(srv *http.Server, l net.Listener) {
+		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
-	}()
+	}
+	go serve(s.httpSrv, ln)
+	if s.dataSrv != nil {
+		go serve(s.dataSrv, dataLn)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -156,9 +191,20 @@ func (s *Server) listen() (net.Listener, error) {
 	return &credListener{Listener: ln}, nil
 }
 
-// routes builds the admin-plane handler (SPEC 6.2). Provider/key/proxy-key
-// CRUD arrives with the data-plane milestone.
-func (s *Server) routes() http.Handler {
+// listenData binds the OpenAI-compatible data plane to 127.0.0.1 only
+// (SPEC 6.1, 8.7: non-loopback binds require TLS, which v1.0 does not offer).
+func (s *Server) listenData() (net.Listener, error) {
+	addr := fmt.Sprintf("127.0.0.1:%d", s.opts.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("server: data plane listen %s: %w", addr, err)
+	}
+	return ln, nil
+}
+
+// adminRoutes builds the admin-plane handler (SPEC 6.2). Provider/key/proxy-key
+// CRUD arrives with the hardening milestone.
+func (s *Server) adminRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1admin/status", s.handleStatus)
 	mux.HandleFunc("POST /v1admin/unlock", s.handleUnlock)
@@ -246,6 +292,7 @@ func (s *Server) unlock(passphrase []byte) (int, error) {
 	}
 	n := len(creds)
 	s.ring.Unlock(creds) // takes ownership; zeroizes any previous contents (SPEC 4.2)
+	s.clearModelsCache() // cached /models were fetched under possibly-rotated keys
 	s.touch()
 	return n, nil
 }
@@ -340,14 +387,18 @@ func (s *Server) statusSnapshot() Status {
 	return st
 }
 
-// shutdown closes the listener, zeroizes the keyring and removes the socket
+// shutdown closes both planes, zeroizes the keyring and removes the socket
 // file (SPEC 4.2: lock on SIGHUP or server shutdown). Safe to call twice.
 func (s *Server) shutdown(reason string) {
 	s.mu.Lock()
 	srv := s.httpSrv
+	data := s.dataSrv
 	s.mu.Unlock()
 	if srv != nil {
 		_ = srv.Close()
+	}
+	if data != nil {
+		_ = data.Close()
 	}
 	s.lockFor(reason)
 	_ = os.Remove(s.opts.SocketPath)

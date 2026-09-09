@@ -98,7 +98,7 @@ func startTestServer(t *testing.T, home string) (*Server, *Client) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s.httpSrv = &http.Server{Handler: s.routes()}
+	s.httpSrv = &http.Server{Handler: s.adminRoutes()}
 	go func() { _ = s.httpSrv.Serve(ln) }()
 	t.Cleanup(func() { s.shutdown("test") })
 	return s, NewClient(SocketPath(home))

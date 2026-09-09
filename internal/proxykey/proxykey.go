@@ -8,11 +8,23 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
-
-	"github.com/ZN9-KYANT/aivault/internal/errs"
 )
+
+// file is the on-disk proxykeys.json schema (SPEC 4.4). Plaintext keys are
+// never stored — only SHA-256 digests.
+type file struct {
+	Version   int   `json:"version"`
+	ProxyKeys []Key `json:"proxy_keys"`
+}
+
+const fileVersion = 1
 
 // Key is one proxy-key record as stored (hashed) in proxykeys.json (SPEC 4.4).
 type Key struct {
@@ -58,7 +70,9 @@ func Verify(k *Key, plaintext string) bool {
 	return subtle.ConstantTimeCompare(sum[:], stored) == 1
 }
 
-// Store persists proxy keys to proxykeys.json (SPEC 4.4).
+// Store persists proxy keys to proxykeys.json (SPEC 4.4): SHA-256 hashes
+// only, atomic 0600 writes. The gateway re-reads the file per request so CLI
+// changes (create/revoke) take effect immediately.
 type Store struct {
 	path string
 }
@@ -66,11 +80,119 @@ type Store struct {
 // NewStore returns a Store backed by path.
 func NewStore(path string) *Store { return &Store{path: path} }
 
-// List returns all keys (stub).
-func (s *Store) List() ([]Key, error) { return nil, errs.ErrNotImplemented }
+// DefaultPath returns proxykeys.json under the aivault home (SPEC 4.4).
+func DefaultPath(home string) string { return filepath.Join(home, "proxykeys.json") }
 
-// Add stores a newly generated key (stub).
-func (s *Store) Add(k *Key) error { return errs.ErrNotImplemented }
+// Load reads all keys; a missing file yields an empty list.
+func (s *Store) Load() ([]Key, error) {
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("proxykey: read: %w", err)
+	}
+	var f file
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, fmt.Errorf("proxykey: parse %s: %w", s.path, err)
+	}
+	return f.ProxyKeys, nil
+}
 
-// Revoke marks the key with the given ID revoked (stub).
-func (s *Store) Revoke(id string) error { return errs.ErrNotImplemented }
+// List returns all keys (including revoked; callers filter for display).
+func (s *Store) List() ([]Key, error) { return s.Load() }
+
+// Lookup returns the key whose SHA-256 matches plaintext, comparing in
+// constant time over every stored digest (SPEC 4.4, 8.5). A missing or
+// non-matching key yields (nil, nil).
+func (s *Store) Lookup(plaintext string) (*Key, error) {
+	keys, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(plaintext))
+	var found *Key
+	for i := range keys {
+		stored, err := hex.DecodeString(keys[i].SHA256)
+		if err != nil {
+			continue
+		}
+		// Compare against every digest so a match does not short-circuit early.
+		if subtle.ConstantTimeCompare(sum[:], stored) == 1 {
+			found = &keys[i]
+		}
+	}
+	return found, nil
+}
+
+// Add stores a newly generated key; names must be unique (SPEC 4.4).
+func (s *Store) Add(k *Key) error {
+	keys, err := s.Load()
+	if err != nil {
+		return err
+	}
+	for _, e := range keys {
+		if e.Name == k.Name {
+			return fmt.Errorf("proxykey: name %q already exists", k.Name)
+		}
+		if e.ID == k.ID {
+			return fmt.Errorf("proxykey: id %q already exists", k.ID)
+		}
+	}
+	f := file{Version: fileVersion, ProxyKeys: append(keys, *k)}
+	return s.save(&f)
+}
+
+// Revoke marks the key with the given ID or name revoked and returns the
+// record updated (SPEC 4.4).
+func (s *Store) Revoke(idOrName string) (*Key, error) {
+	keys, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	for i := range keys {
+		if keys[i].ID == idOrName || keys[i].Name == idOrName {
+			keys[i].Revoked = true
+			if err := s.save(&file{Version: fileVersion, ProxyKeys: keys}); err != nil {
+				return nil, err
+			}
+			k := keys[i]
+			return &k, nil
+		}
+	}
+	return nil, fmt.Errorf("proxykey: no key with id or name %q", idOrName)
+}
+
+func (s *Store) save(f *file) error {
+	if f.Version == 0 {
+		f.Version = fileVersion
+	}
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return fmt.Errorf("proxykey: encode: %w", err)
+	}
+	data = append(data, '\n')
+	return writeFileAtomic(s.path, data, 0o600)
+}
+
+// writeFileAtomic writes data to path via an O_EXCL tmp file + rename
+// (SPEC 8.2), mirroring the vault store.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("proxykey: stale tmp: %w", err)
+	}
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return fmt.Errorf("proxykey: create tmp: %w", err)
+	}
+	defer os.Remove(tmp) // no-op after a successful rename
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("proxykey: write tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("proxykey: close tmp: %w", err)
+	}
+	return os.Rename(tmp, path)
+}
