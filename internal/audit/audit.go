@@ -18,8 +18,12 @@ const (
 	EventUnlock         = "unlock"
 	EventLock           = "lock"
 	EventKeyAdd         = "key.add"
+	EventKeyRemove      = "key.remove"
+	EventKeyRotate      = "key.rotate"
 	EventKeyUse         = "key.use"
 	EventProxyKeyCreate = "proxykey.create"
+	EventProviderAdd    = "provider.add"
+	EventPasswd         = "passwd"
 	EventAuthFail       = "auth.fail"
 )
 

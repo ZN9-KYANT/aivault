@@ -43,6 +43,21 @@ func readSecret(prompt string) ([]byte, error) {
 	return []byte(strings.TrimRight(line, " \t\r\n")), nil
 }
 
+// readLine prompts and reads a plain (echoed) line — for confirmations and
+// other non-secret input. It shares the non-tty reader with readSecret so
+// mixed piped prompts stay in order.
+func readLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	if stdinLine == nil {
+		stdinLine = bufio.NewReader(os.Stdin)
+	}
+	line, err := stdinLine.ReadString('\n')
+	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+		return "", fmt.Errorf("read input: %w", err)
+	}
+	return strings.TrimRight(line, " \t\r\n"), nil
+}
+
 // promptNewPassphrase double-prompts and validates the master passphrase
 // (SPEC 4.1: min 12 chars, zxcvhn strength >= 3).
 func promptNewPassphrase() ([]byte, error) {

@@ -2,12 +2,17 @@ package cli
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/config"
 	"github.com/ZN9-KYANT/aivault/internal/errs"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
@@ -143,8 +148,141 @@ func newPasswdCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "passwd",
 		Short: "Change the master passphrase (re-encrypts every vault file)",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("passwd: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runPasswd,
 	}
+}
+
+// runPasswd implements SPEC 4.1: verify the current passphrase via the
+// verifier blob, re-encrypt every vault file under the new passphrase
+// (fresh age scrypt recipients), then re-wrap the verifier under a new
+// Argon2id KEK. Every vault file is decrypted before anything is written
+// so an unreadable file aborts with no changes made.
+func runPasswd(cmd *cobra.Command, _ []string) error {
+	home := homeDir(cmd)
+	cfg, err := loadVaultConfig(home)
+	if err != nil {
+		return err
+	}
+	st := vault.NewStore(home)
+
+	old, err := readSecret("Current master passphrase: ")
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(old)
+	if err := cfg.VerifyPassphrase(old); err != nil {
+		_ = audit.Log(auditPath(home), audit.Entry{Event: audit.EventAuthFail, Outcome: "wrong-passphrase"})
+		if errors.Is(err, kdf.ErrWrongPassphrase) {
+			return fmt.Errorf("incorrect passphrase")
+		}
+		return fmt.Errorf("verify passphrase: %w", err)
+	}
+
+	ids, err := vaultProviders(home)
+	if err != nil {
+		return err
+	}
+	payloads := make([]*vault.Payload, 0, len(ids))
+	for _, id := range ids {
+		p, err := st.Load(id, old)
+		if err != nil {
+			return fmt.Errorf("passwd: cannot decrypt %s (nothing changed): %w", id, err)
+		}
+		payloads = append(payloads, p)
+	}
+
+	newPass, err := promptNewPassphrase()
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(newPass)
+
+	for i, id := range ids {
+		if err := st.Save(id, newPass, payloads[i]); err != nil {
+			return fmt.Errorf("passwd: re-encrypt %s: %w", id, err)
+		}
+	}
+	for _, p := range payloads { // best-effort: drop decrypted secrets from memory
+		p.APIKey = nil
+		p.None = nil
+	}
+
+	// Fresh salt + params; re-wrap the verifier under the new KEK (SPEC 4.1).
+	params, err := kdf.NewParams()
+	if err != nil {
+		return fmt.Errorf("passwd: %w", err)
+	}
+	kek, err := kdf.DeriveKEK(newPass, params)
+	if err != nil {
+		return fmt.Errorf("passwd: %w", err)
+	}
+	defer kdf.Zeroize(kek)
+	blob, err := kdf.WrapVerifier(kek)
+	if err != nil {
+		return fmt.Errorf("passwd: %w", err)
+	}
+	cfg.KDF = *params
+	cfg.Verifier = hex.EncodeToString(blob)
+	if err := config.Save(config.Path(home), cfg); err != nil {
+		return fmt.Errorf("passwd: %w", err)
+	}
+
+	if err := audit.Log(auditPath(home), audit.Entry{Event: audit.EventPasswd, Outcome: "ok"}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: audit log: %v\n", err)
+	}
+	fmt.Printf("Master passphrase changed; re-encrypted %d vault file(s)\n", len(ids))
+	return nil
+}
+
+// loadVaultConfig loads config.toml with the standard not-initialized hint.
+func loadVaultConfig(home string) (*config.Config, error) {
+	cfg, err := config.Load(config.Path(home))
+	if err != nil {
+		return nil, fmt.Errorf("vault not initialized at %s (run aivault init first): %w", home, err)
+	}
+	return cfg, nil
+}
+
+// readAndVerifyPassphrase prompts for the master passphrase and checks it
+// against the config.toml verifier blob without decrypting any vault file
+// (SPEC 4.1); auth failures are audited. The caller must Zeroize the
+// returned passphrase.
+func readAndVerifyPassphrase(home string, cfg *config.Config, prompt string) ([]byte, error) {
+	pass, err := readSecret(prompt)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.VerifyPassphrase(pass); err != nil {
+		_ = audit.Log(auditPath(home), audit.Entry{Event: audit.EventAuthFail, Outcome: "wrong-passphrase"})
+		kdf.Zeroize(pass)
+		if errors.Is(err, kdf.ErrWrongPassphrase) {
+			return nil, fmt.Errorf("incorrect passphrase")
+		}
+		return nil, fmt.Errorf("verify passphrase: %w", err)
+	}
+	return pass, nil
+}
+
+// vaultProviders lists provider IDs with an existing vault file under
+// home/vault, sorted. Passwd iterates the directory — not meta.json — so
+// files missing from the index are still re-encrypted.
+func vaultProviders(home string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(home, "vault"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("passwd: read vault dir: %w", err)
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if id, ok := strings.CutSuffix(e.Name(), vault.FileSuffix); ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }

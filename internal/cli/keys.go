@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,8 +13,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
-	"github.com/ZN9-KYANT/aivault/internal/config"
-	"github.com/ZN9-KYANT/aivault/internal/errs"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
 	"github.com/ZN9-KYANT/aivault/internal/provider"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
@@ -43,30 +40,24 @@ func newKeysCmd() *cobra.Command {
 
 	show := &cobra.Command{
 		Use:   "show <provider>",
-		Short: "Show the stored key (hint by default; requires unlock)",
+		Short: "Show a stored key (hint by default; --reveal prints the full key)",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("keys show: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runKeysShow,
 	}
-	show.Flags().Bool("reveal", false, "print the full key instead of the hint")
+	show.Flags().Bool("reveal", false, "decrypt the vault and print the full key (SPEC 7)")
 
 	remove := &cobra.Command{
 		Use:   "remove <provider>",
-		Short: "Remove a provider's stored key",
+		Short: "Remove a provider's stored key (asks for confirmation)",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("keys remove: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runKeysRemove,
 	}
 
 	rotate := &cobra.Command{
 		Use:   "rotate <provider>",
 		Short: "Replace a provider's key (via --key-stdin or hidden prompt)",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("keys rotate: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runKeysRotate,
 	}
 	rotate.Flags().Bool("key-stdin", false, "read the new key from stdin (consumes all of stdin)")
 
@@ -78,9 +69,9 @@ func runKeysAdd(cmd *cobra.Command, args []string) error {
 	home := homeDir(cmd)
 	id := args[0]
 
-	cfg, err := config.Load(config.Path(home))
+	cfg, err := loadVaultConfig(home)
 	if err != nil {
-		return fmt.Errorf("vault not initialized at %s (run aivault init first): %w", home, err)
+		return err
 	}
 	if !provider.ValidID(id) {
 		return fmt.Errorf("invalid provider ID %q (must match [a-z0-9][a-z0-9-]{0,31})", id)
@@ -114,18 +105,11 @@ func runKeysAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("empty API key")
 	}
 
-	pass, err := readSecret("Master passphrase: ")
+	pass, err := readAndVerifyPassphrase(home, cfg, "Master passphrase: ")
 	if err != nil {
 		return err
 	}
 	defer kdf.Zeroize(pass)
-	if err := cfg.VerifyPassphrase(pass); err != nil {
-		_ = audit.Log(auditPath(home), audit.Entry{Event: audit.EventAuthFail, Outcome: "wrong-passphrase"})
-		if errors.Is(err, kdf.ErrWrongPassphrase) {
-			return fmt.Errorf("incorrect passphrase")
-		}
-		return fmt.Errorf("verify passphrase: %w", err)
-	}
 
 	payload := &vault.Payload{
 		Version:  vault.PayloadVersion,
@@ -162,6 +146,172 @@ func runKeysAdd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runKeysShow(cmd *cobra.Command, args []string) error {
+	home := homeDir(cmd)
+	id := args[0]
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		return err
+	}
+	pm, ok := meta.Providers[id]
+	if !ok {
+		return fmt.Errorf("no credential stored for %q (see aivault keys list)", id)
+	}
+	if pm.Kind == string(vault.KindNone) {
+		fmt.Printf("%s: no API key (credential-free provider, base URL %s)\n", id, pm.BaseURL)
+		return nil
+	}
+
+	// The hint lives in plaintext meta.json (SPEC 3.3) — no unlock needed.
+	reveal, _ := cmd.Flags().GetBool("reveal")
+	if !reveal && pm.KeyHint != "" {
+		fmt.Printf("%s: %s\n", id, pm.KeyHint)
+		return nil
+	}
+
+	// --reveal (or a missing hint) needs the master passphrase (SPEC 4.1).
+	cfg, err := loadVaultConfig(home)
+	if err != nil {
+		return err
+	}
+	pass, err := readAndVerifyPassphrase(home, cfg, "Master passphrase: ")
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(pass)
+	p, err := st.Load(id, pass)
+	if err != nil {
+		return err
+	}
+	if p.APIKey == nil {
+		return fmt.Errorf("vault: no API key payload for %q", id)
+	}
+	if !reveal {
+		fmt.Printf("%s: %s\n", id, vault.KeyHint(p.APIKey.Key))
+		return nil
+	}
+	fmt.Printf("%s: %s\n", id, p.APIKey.Key)
+	return nil
+}
+
+// runKeysRemove deletes the encrypted vault file (if any) and the meta.json
+// entry. It deliberately does not require the passphrase: removing a file is
+// equivalent to an rm, which is always possible for the user of the home
+// dir — the vault protects confidentiality, not availability (SPEC 8.2).
+func runKeysRemove(cmd *cobra.Command, args []string) error {
+	home := homeDir(cmd)
+	id := args[0]
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		return err
+	}
+	pm, inMeta := meta.Providers[id]
+	hasFile := hasVaultFile(st, id)
+	if !inMeta && !hasFile {
+		return fmt.Errorf("no credential stored for %q (see aivault keys list)", id)
+	}
+
+	what := fmt.Sprintf("stored key for %s", id)
+	if _, isBuiltin := provider.BuiltinByID(id); !isBuiltin {
+		what = fmt.Sprintf("stored key and registration for %s", id)
+	}
+	if inMeta && pm.Kind == string(vault.KindNone) && !hasFile {
+		what = fmt.Sprintf("credential-free provider registration %s", id)
+	}
+	ans, err := readLine(fmt.Sprintf("Remove %s? (y/N) ", what))
+	if err != nil {
+		return err
+	}
+	if t := strings.ToLower(strings.TrimSpace(ans)); t != "y" && t != "yes" {
+		fmt.Println("aborted — nothing removed")
+		return nil
+	}
+
+	// Remove the encrypted file first, then the index entry (SPEC 8.2).
+	if hasFile {
+		if err := st.DeleteProvider(id); err != nil {
+			return fmt.Errorf("remove vault file: %w", err)
+		}
+	}
+	if inMeta {
+		delete(meta.Providers, id)
+		if err := st.SaveMeta(meta); err != nil {
+			return fmt.Errorf("save meta: %w", err)
+		}
+	}
+
+	if err := audit.Log(auditPath(home), audit.Entry{Event: audit.EventKeyRemove, Provider: id, Outcome: "ok"}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: audit log: %v\n", err)
+	}
+	fmt.Printf("Removed %s\n", what)
+	return nil
+}
+
+// runKeysRotate replaces a provider's API key, preserving the payload's base
+// URL and custom headers (SPEC 3.4, 7).
+func runKeysRotate(cmd *cobra.Command, args []string) error {
+	home := homeDir(cmd)
+	id := args[0]
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		return err
+	}
+	pm, ok := meta.Providers[id]
+	if !ok {
+		return fmt.Errorf("no credential stored for %q — use aivault keys add", id)
+	}
+	if pm.Kind == string(vault.KindNone) {
+		return fmt.Errorf("provider %q is credential-free (kind none); nothing to rotate", id)
+	}
+
+	key, err := readProviderKey(cmd, id)
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(key)
+	if len(key) == 0 {
+		return fmt.Errorf("empty API key")
+	}
+
+	cfg, err := loadVaultConfig(home)
+	if err != nil {
+		return err
+	}
+	pass, err := readAndVerifyPassphrase(home, cfg, "Master passphrase: ")
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(pass)
+
+	old, err := st.Load(id, pass)
+	if err != nil {
+		return fmt.Errorf("load existing key: %w", err)
+	}
+	if old.APIKey == nil {
+		return fmt.Errorf("vault: payload for %q has no API key", id)
+	}
+	old.APIKey.Key = string(key)
+	if err := st.Save(id, pass, old); err != nil {
+		return fmt.Errorf("store key: %w", err)
+	}
+
+	pm.KeyHint = vault.KeyHint(string(key))
+	pm.UpdatedAt = time.Now().UTC()
+	meta.Providers[id] = pm
+	if err := st.SaveMeta(meta); err != nil {
+		return fmt.Errorf("save meta: %w", err)
+	}
+
+	if err := audit.Log(auditPath(home), audit.Entry{Event: audit.EventKeyRotate, Provider: id, Outcome: "ok"}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: audit log: %v\n", err)
+	}
+	fmt.Printf("Rotated API key for %s (%s)\n", id, vault.KeyHint(string(key)))
+	return nil
+}
+
 // readProviderKey reads the provider API key per the SPEC 8 security rules:
 // --key-stdin first, then $AIVAULT_<PROVIDER>_KEY (with warning), then a
 // hidden prompt.
@@ -183,6 +333,12 @@ func readProviderKey(cmd *cobra.Command, id string) ([]byte, error) {
 		return nil, err
 	}
 	return key, nil
+}
+
+// hasVaultFile reports whether vault/<provider>.json.age exists.
+func hasVaultFile(st *vault.Store, id string) bool {
+	_, err := os.Stat(st.ProviderPath(id))
+	return err == nil
 }
 
 func runKeysList(cmd *cobra.Command, _ []string) error {

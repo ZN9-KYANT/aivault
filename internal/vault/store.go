@@ -42,9 +42,13 @@ func DefaultHome() (string, error) {
 	return filepath.Join(home, ".aivault"), nil
 }
 
+// FileSuffix is the filename suffix of an encrypted provider payload
+// (SPEC 3.2): vault/<provider>.json.age.
+const FileSuffix = ".json.age"
+
 // ProviderPath returns vault/<provider>.json.age for a provider file.
 func (s *Store) ProviderPath(provider string) string {
-	return filepath.Join(s.dir, "vault", provider+".json.age")
+	return filepath.Join(s.dir, "vault", provider+FileSuffix)
 }
 
 // Save atomically encrypts p to vault/<provider>.json.age using the master
@@ -132,6 +136,16 @@ func (s *Store) Load(provider string, passphrase []byte) (*Payload, error) {
 
 func (s *Store) metaPath() string {
 	return filepath.Join(s.dir, "meta.json")
+}
+
+// DeleteProvider removes vault/<provider>.json.age; a missing file is not an
+// error (SPEC 8.2: removal is not a hot path, a plain unlink is fine).
+func (s *Store) DeleteProvider(provider string) error {
+	err := os.Remove(s.ProviderPath(provider))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // LoadMeta reads the plaintext index meta.json (SPEC 3.3). A missing file
