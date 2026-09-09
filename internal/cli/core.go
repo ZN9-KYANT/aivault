@@ -14,8 +14,8 @@ import (
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/config"
-	"github.com/ZN9-KYANT/aivault/internal/errs"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
+	"github.com/ZN9-KYANT/aivault/internal/server"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
 
@@ -73,34 +73,107 @@ func runInit(cmd *cobra.Command, _ []string) error {
 func newServeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Run the gateway server",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("serve: %w", errs.ErrNotImplemented)
-		},
+		Short: "Run the gateway server (admin plane on the unix socket; data plane pending)",
+		RunE:  runServe,
 	}
-	cmd.Flags().Int("port", 8317, "gateway port (SPEC 6.1)")
-	cmd.Flags().String("config", "", "path to config file")
+	cmd.Flags().Int("port", 8317, "gateway port (SPEC 6.1, reserved until the data-plane milestone)")
+	cmd.Flags().String("config", "", "path to config file (default <home>/config.toml)")
 	return cmd
+}
+
+func runServe(cmd *cobra.Command, _ []string) error {
+	home := homeDir(cmd)
+	cfgPath := config.Path(home)
+	if cp, _ := cmd.Flags().GetString("config"); cp != "" {
+		cfgPath = cp
+	}
+	cfg, err := loadConfigFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	if cmd.Flags().Changed("port") {
+		p, _ := cmd.Flags().GetInt("port")
+		cfg.Server.Port = p
+	}
+
+	opts := server.Options{
+		Home:         home,
+		ConfigPath:   cfgPath,
+		SocketPath:   server.SocketPath(home),
+		Port:         cfg.Server.Port,
+		AutoLockMins: cfg.AutoLockMins,
+	}
+	fmt.Printf("aivault server: admin socket %s\n", opts.SocketPath)
+	fmt.Printf("auto-lock: %d min idle (0 disables)\n", opts.AutoLockMins)
+	fmt.Println("data plane: pending (proxy keys + /v1 endpoints — next milestone)")
+	return server.New(opts).Run()
+}
+
+// loadConfigFile loads an explicit config.toml path (serve supports
+// --config; the other commands always use <home>/config.toml).
+func loadConfigFile(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("vault not initialized at %s (run aivault init first): %w", path, err)
+	}
+	return cfg, nil
 }
 
 func newUnlockCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "unlock",
 		Short: "Prompt for the passphrase and decrypt all enabled providers into the server keyring",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("unlock: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runUnlock,
 	}
+}
+
+// runUnlock implements SPEC 4.2: verify the passphrase locally against the
+// verifier blob, then send it over the admin unix socket; the server
+// re-verifies and decrypts every enabled provider into the keyring. The CLI
+// holds no unlock state (the peer-UID-checked socket is the transport).
+func runUnlock(cmd *cobra.Command, _ []string) error {
+	home := homeDir(cmd)
+	sock := server.SocketPath(home)
+	c := server.NewClient(sock)
+	if _, err := c.Status(); err != nil {
+		return fmt.Errorf("server not running at %s (start it with: aivault serve): %w", sock, err)
+	}
+	cfg, err := loadVaultConfig(home)
+	if err != nil {
+		return err
+	}
+	pass, err := readAndVerifyPassphrase(home, cfg, "Master passphrase: ")
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(pass)
+	st, err := c.Unlock(pass)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Unlocked %d provider(s) into the server keyring\n", st.Providers)
+	return nil
 }
 
 func newLockCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "lock",
 		Short: "Zeroize the server keyring immediately",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("lock: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runLock,
 	}
+}
+
+func runLock(cmd *cobra.Command, _ []string) error {
+	sock := server.SocketPath(homeDir(cmd))
+	c := server.NewClient(sock)
+	if _, err := c.Status(); err != nil {
+		return fmt.Errorf("server not running at %s — the keyring is already empty: %w", sock, err)
+	}
+	if _, err := c.Lock(); err != nil {
+		return err
+	}
+	fmt.Println("Locked the server keyring")
+	return nil
 }
 
 func newStatusCmd() *cobra.Command {
@@ -140,7 +213,20 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	fmt.Printf("providers: %d stored (%d enabled)\n", len(meta.Providers), enabled)
-	fmt.Println("gateway: not running (server milestone pending)")
+
+	// Admin plane (SPEC 4.3, 6.2): live server status when reachable.
+	sock := server.SocketPath(home)
+	if st, err := server.NewClient(sock).Status(); err == nil {
+		if st.Locked {
+			fmt.Printf("gateway: running (locked) on %s\n", sock)
+		} else {
+			fmt.Printf("gateway: running (unlocked, %d provider(s), idle %.1f min) on %s\n",
+				st.Providers, st.IdleMinutes, sock)
+		}
+		fmt.Printf("auto-lock: %d min idle\n", st.AutoLockMinutes)
+	} else {
+		fmt.Printf("gateway: not running (start: aivault serve — socket %s)\n", sock)
+	}
 	return nil
 }
 

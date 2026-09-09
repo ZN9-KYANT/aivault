@@ -40,6 +40,22 @@ func (k *Keyring) Lock() {
 	k.unlocked = false
 }
 
+// Discard zeroizes credential material in a payload map that is NOT owned by
+// a keyring (SPEC 4.2 best-effort) — used to drop partially decrypted creds
+// after a failed unlock batch. The map is emptied.
+func Discard(creds map[string]*vault.Payload) {
+	for id, p := range creds {
+		if p != nil {
+			if p.APIKey != nil {
+				p.APIKey.Key = ""
+				p.APIKey.Headers = nil
+			}
+			p.None = nil
+		}
+		delete(creds, id)
+	}
+}
+
 // Unlocked reports whether the keyring currently holds credentials.
 func (k *Keyring) Unlocked() bool {
 	k.mu.RLock()
@@ -71,14 +87,6 @@ func (k *Keyring) Providers() []string {
 // Go strings are garbage-collected, so this is best-effort — hard
 // zeroization and mlock are the memory-hygiene milestone (SPEC 8.3).
 func (k *Keyring) clearLocked() {
-	for id, p := range k.creds {
-		if p != nil {
-			if p.APIKey != nil {
-				p.APIKey.Key = ""
-				p.APIKey.Headers = nil
-			}
-			p.None = nil
-		}
-		delete(k.creds, id)
-	}
+	Discard(k.creds)
+	k.creds = make(map[string]*vault.Payload)
 }
