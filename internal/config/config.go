@@ -25,10 +25,28 @@ type Admin struct {
 	Token   string `toml:"token"`  // hex-encoded random 32 bytes; never printed after init
 }
 
+// Spend configures per-token cost estimation for proxy-key spend caps
+// (SPEC 8.8): USD per 1M tokens, with an optional per-model-prefix table.
+type Spend struct {
+	InputUSDPer1M  float64      `toml:"input_usd_per_1m"`
+	OutputUSDPer1M float64      `toml:"output_usd_per_1m"`
+	ModelPrices    []ModelPrice `toml:"model_prices"`
+}
+
+// ModelPrice overrides the default estimate for models whose namespaced
+// name starts with Prefix; the first match wins.
+type ModelPrice struct {
+	Prefix         string  `toml:"prefix"`
+	InputUSDPer1M  float64 `toml:"input_usd_per_1m"`
+	OutputUSDPer1M float64 `toml:"output_usd_per_1m"`
+}
+
 // Config mirrors config.toml.
 type Config struct {
 	Server       Server     `toml:"server"`
 	AutoLockMins int        `toml:"auto_lock_minutes"`
+	Failover     bool       `toml:"failover"` // retry next alias chain entry on 429/5xx/timeout (SPEC 6.1, default off)
+	Spend        Spend      `toml:"spend"`
 	KDF          kdf.Params `toml:"kdf"`
 	Verifier     string     `toml:"verifier"` // hex-encoded KEK-wrapped verifier blob (SPEC 4.1)
 	Admin        Admin      `toml:"admin"`
@@ -40,6 +58,7 @@ func Default() *Config {
 	return &Config{
 		Server:       Server{Port: 8317},
 		AutoLockMins: 15,
+		Spend:        Spend{InputUSDPer1M: 0.5, OutputUSDPer1M: 1.5}, // rough cross-provider default estimate
 	}
 }
 

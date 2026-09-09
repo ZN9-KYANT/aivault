@@ -23,6 +23,7 @@ import (
 	"github.com/ZN9-KYANT/aivault/internal/config"
 	"github.com/ZN9-KYANT/aivault/internal/keyring"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
+	"github.com/ZN9-KYANT/aivault/internal/redact"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
 
@@ -60,6 +61,7 @@ type Server struct {
 	upstream    *http.Client            // provider requests (SPEC 6.1)
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelsEntry // provider → cached /models (SPEC 5)
+	limiter     *limiter               // per-proxy-key rate + spend (SPEC 8.8)
 }
 
 // New returns a Server with the given options.
@@ -69,6 +71,7 @@ func New(opts Options) *Server {
 		auditLog:     filepath.Join(opts.Home, "audit.log"),
 		ring:         keyring.New(),
 		autoLockMins: opts.AutoLockMins,
+		limiter:      newLimiter(),
 		modelsCache:  make(map[string]modelsEntry),
 		upstream: &http.Client{
 			// No overall Timeout: streaming responses must stay open (SPEC 6.1).
@@ -293,6 +296,7 @@ func (s *Server) unlock(passphrase []byte) (int, error) {
 	n := len(creds)
 	s.ring.Unlock(creds) // takes ownership; zeroizes any previous contents (SPEC 4.2)
 	s.clearModelsCache() // cached /models were fetched under possibly-rotated keys
+	s.registerSecrets(creds)
 	s.touch()
 	return n, nil
 }
@@ -339,9 +343,22 @@ func (s *Server) lockFor(reason string) {
 		return
 	}
 	s.ring.Lock()
+	redact.Reset()
 	if err := audit.Log(s.auditLog, audit.Entry{Event: audit.EventLock, Outcome: reason}); err != nil {
 		fmt.Fprintf(os.Stderr, "server: audit log: %v\n", err)
 	}
+}
+
+// registerSecrets feeds decrypted credentials to the redaction filter so no
+// log sink can echo a live key (SPEC 8.4).
+func (s *Server) registerSecrets(creds map[string]*vault.Payload) {
+	vals := make([]string, 0, len(creds))
+	for _, p := range creds {
+		if p != nil && p.APIKey != nil && p.APIKey.Key != "" {
+			vals = append(vals, p.APIKey.Key)
+		}
+	}
+	redact.Register(vals)
 }
 
 // touch records keyring activity for the idle auto-lock (SPEC 4.2). Only

@@ -1,17 +1,22 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
-	"github.com/ZN9-KYANT/aivault/internal/errs"
+	"github.com/ZN9-KYANT/aivault/internal/kdf"
 	"github.com/ZN9-KYANT/aivault/internal/provider"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
@@ -30,19 +35,16 @@ func newProvidersCmd() *cobra.Command {
 
 	models := &cobra.Command{
 		Use:   "models",
-		Short: "List cached /models per provider",
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("providers models: %w", errs.ErrNotImplemented)
-		},
+		Short: "Fetch and list live /models for enabled OpenAI-compatible providers",
+		RunE:  runProvidersModels,
 	}
+	models.Flags().String("provider", "", "limit to one provider ID")
 
 	test := &cobra.Command{
 		Use:   "test <provider>",
-		Short: "Test a provider's stored credential",
+		Short: "Test a provider's stored credential (GET /models)",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(*cobra.Command, []string) error {
-			return fmt.Errorf("providers test: %w", errs.ErrNotImplemented)
-		},
+		RunE:  runProvidersTest,
 	}
 
 	add := &cobra.Command{
@@ -57,7 +59,206 @@ func newProvidersCmd() *cobra.Command {
 	return providers
 }
 
-// runProvidersAdd registers a custom provider in meta.json (SPEC 5): a
+// providerClient fetches provider /models with a stored credential
+// (OpenAI-compatible only, SPEC 5).
+type providerClient struct{ client *http.Client }
+
+func newProviderClient() *providerClient {
+	return &providerClient{client: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// probe fetches <base>/models and returns the model count and ids, or an
+// error describing the upstream response.
+func (pc *providerClient) probe(baseURL, cred string) (int, []string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	if cred != "" {
+		req.Header.Set("Authorization", "Bearer "+cred)
+	}
+	resp, err := pc.client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+		return resp.StatusCode, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&parsed); err != nil {
+		return 0, nil, fmt.Errorf("HTTP 200 but unparseable: %w", err)
+	}
+	ids := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		ids = append(ids, m.ID)
+	}
+	return len(ids), ids, nil
+}
+
+// providerTarget is one decrypted provider ready for a manual probe.
+type providerTarget struct {
+	id      string
+	baseURL string
+	cred    string
+}
+
+// providersTargets decrypts every enabled OpenAI-compatible provider with a
+// stored key (or just `only`) into probe targets. The caller must Zeroize
+// the returned passphrase.
+func providersTargets(cmd *cobra.Command, only string) ([]providerTarget, []byte, error) {
+	home := homeDir(cmd)
+	cfg, err := loadVaultConfig(home)
+	if err != nil {
+		return nil, nil, err
+	}
+	pass, err := readAndVerifyPassphrase(home, cfg, "Master passphrase: ")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, len(meta.Providers))
+	for id, pm := range meta.Providers {
+		if !pm.Enabled || pm.Kind != string(vault.KindAPIKey) || !hasVaultFile(st, id) {
+			continue
+		}
+		if p, isBuiltin := provider.BuiltinByID(id); isBuiltin && !p.OpenAICompat {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if only != "" {
+		if !containsID(ids, only) {
+			return nil, nil, fmt.Errorf("provider %q is not an enabled OpenAI-compatible provider with a stored key", only)
+		}
+		ids = []string{only}
+	}
+
+	out := make([]providerTarget, 0, len(ids))
+	for _, id := range ids {
+		p, err := st.Load(id, pass)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", id, err)
+			continue
+		}
+		if p.APIKey == nil || p.APIKey.BaseURL == "" {
+			continue
+		}
+		out = append(out, providerTarget{id: id, baseURL: p.APIKey.BaseURL, cred: p.APIKey.Key})
+	}
+	return out, pass, nil
+}
+
+func containsID(list []string, v string) bool {
+	for _, e := range list {
+		if e == v {
+			return true
+		}
+	}
+	return false
+}
+
+// runProvidersModels lists live /models per enabled OpenAI-compatible
+// provider (SPEC 5: `providers models`). Requires the master passphrase; no
+// server involved.
+func runProvidersModels(cmd *cobra.Command, _ []string) error {
+	only, _ := cmd.Flags().GetString("provider")
+	targets, pass, err := providersTargets(cmd, only)
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(pass)
+	if len(targets) == 0 {
+		fmt.Println("No enabled OpenAI-compatible providers with stored keys.")
+		return nil
+	}
+	pc := newProviderClient()
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "PROVIDER\tMODELS\tFIRST MODELS")
+	for _, t := range targets {
+		_, list, err := pc.probe(t.baseURL, t.cred)
+		if err != nil {
+			fmt.Fprintf(w, "%s\tERROR\t%s\n", t.id, err.Error())
+			continue
+		}
+		sample := ""
+		if len(list) > 3 {
+			sample = strings.Join(list[:3], ", ") + " …"
+		} else {
+			sample = strings.Join(list, ", ")
+		}
+		fmt.Fprintf(w, "%s\t%d\t%s\n", t.id, len(list), sample)
+	}
+	return w.Flush()
+}
+
+// runProvidersTest tests one provider's stored credential against its real
+// endpoint (GET /models) and reports the outcome (SPEC 7).
+func runProvidersTest(cmd *cobra.Command, args []string) error {
+	home := homeDir(cmd)
+	id := args[0]
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		return err
+	}
+	pm, ok := meta.Providers[id]
+	if !ok {
+		return fmt.Errorf("no credential stored for %q (see aivault keys list)", id)
+	}
+	if pm.Kind == string(vault.KindNone) {
+		fmt.Printf("%s: credential-free provider (base URL %s) — nothing to test\n", id, pm.BaseURL)
+		return nil
+	}
+	if p, isBuiltin := provider.BuiltinByID(id); isBuiltin && !p.OpenAICompat {
+		return fmt.Errorf("provider %q is not OpenAI wire-compatible; translation shims arrive in v1.1", id)
+	}
+
+	cfg, err := loadVaultConfig(home)
+	if err != nil {
+		return err
+	}
+	pass, err := readAndVerifyPassphrase(home, cfg, "Master passphrase: ")
+	if err != nil {
+		return err
+	}
+	defer kdf.Zeroize(pass)
+	p, err := st.Load(id, pass)
+	if err != nil {
+		return err
+	}
+	if p.APIKey == nil {
+		return fmt.Errorf("vault: no API key payload for %q", id)
+	}
+
+	pc := newProviderClient()
+	count, _, err := pc.probe(p.APIKey.BaseURL, p.APIKey.Key)
+	outcome := fmt.Sprintf("%d", count)
+	if err != nil {
+		outcome = err.Error()
+	}
+	if err := audit.Log(auditPath(home), audit.Entry{Event: audit.EventKeyUse, Provider: id, Outcome: "test/" + outcome}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: audit log: %v\n", err)
+	}
+	if err != nil {
+		return fmt.Errorf("providers test %s: %w", id, err)
+	}
+	fmt.Printf("%s: OK — %s reachable, %d models\n", id, p.APIKey.BaseURL, count)
+	return nil
+}
 // user-defined base URL served through the gateway. Builtin IDs are reserved.
 // Registration stores no secret; keys arrive later via aivault keys add (kind
 // apikey) or never for credential-free local servers (kind none, SPEC 3.4).

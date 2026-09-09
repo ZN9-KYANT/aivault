@@ -59,8 +59,15 @@ func newMockUpstream(t *testing.T) *mockUpstream {
 				f.Flush()
 				return
 			}
+			switch payload["__fail"] {
+			case "leak":
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, `upstream crashed while holding sk-leaky-credential-999999`)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"model": payload["model"], "auth": r.Header.Get("Authorization"),
+				"usage": map[string]int{"prompt_tokens": 1000, "completion_tokens": 1000},
 			})
 		default:
 			fmt.Fprintf(w, `{"path":%q}`, r.URL.Path)
@@ -423,5 +430,181 @@ func TestUnknownEndpointOpenAIShape(t *testing.T) {
 	}
 	if _, ok := body["error"]; !ok {
 		t.Fatalf("404 not OpenAI-shaped: %s", data)
+	}
+}
+func TestRateLimit(t *testing.T) {
+	home, pass, _ := newGateway(t)
+	s, dataURL := startGateway(t, home, pass)
+	_ = s
+
+	pk, plain, _ := proxykey.Generate()
+	pk.Name = "rpm2"
+	pk.Providers = []string{"mock"}
+	pk.RPM = 2
+	if err := proxykey.NewStore(proxykey.DefaultPath(home)).Add(pk); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d = %d, want 200", i, resp.StatusCode)
+		}
+	}
+	resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(data), "rate_limit_exceeded") {
+		t.Fatalf("third request = %d %s, want 429 rate_limit_exceeded", resp.StatusCode, data)
+	}
+}
+
+func TestSpendCap(t *testing.T) {
+	home, pass, _ := newGateway(t)
+	s, dataURL := startGateway(t, home, pass)
+	_ = s
+
+	pk, plain, _ := proxykey.Generate()
+	pk.Name = "capped"
+	pk.Providers = []string{"mock"}
+	pk.MaxUSDPerDay = 0.002 // mock usage: 1000+1000 tokens @ $0.5/$1.5 per 1M = $0.002
+	if err := proxykey.NewStore(proxykey.DefaultPath(home)).Add(pk); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request = %d %s, want 200 (usage accounted)", resp.StatusCode, data)
+	}
+
+	resp = mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+	data, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(data), "spend_cap_reached") {
+		t.Fatalf("second request = %d %s, want 429 spend_cap_reached", resp.StatusCode, data)
+	}
+}
+
+func TestAliasFailover(t *testing.T) {
+	home, pass, _ := newGateway(t)
+
+	// Register a failing provider in front of the good one: always 429.
+	bad := newFailingUpstream(t, http.StatusTooManyRequests,
+		`{"error":{"message":"slow down","type":"rate_limit_error","code":"rate_limit"}}`)
+	st := vault.NewStore(home)
+	if err := st.Save("mockbad", []byte(pass), &vault.Payload{
+		Version: vault.PayloadVersion, Provider: "mockbad", Kind: vault.KindAPIKey,
+		APIKey: &vault.APIKey{Key: "sk-mock-bad", BaseURL: bad.URL},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := st.LoadMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	meta.Providers["mockbad"] = vault.ProviderMeta{
+		Kind: string(vault.KindAPIKey), BaseURL: bad.URL, Enabled: true,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	meta.Aliases = map[string][]string{
+		"best": {"mockbad/dead", "mock/mock-small"},
+	}
+	if err := st.SaveMeta(meta); err != nil {
+		t.Fatal(err)
+	}
+
+	plain := newScopedKey(t, home, "failover-app", []string{"mock", "mockbad", "mockfree"})
+
+	// Failover OFF (default): the failing first entry's error is returned.
+	s, dataURL := startGateway(t, home, pass)
+	resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"best"}`)
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("failover off: = %d %s, want the 429 passthrough", resp.StatusCode, data)
+	}
+	shutdownForTest(s)
+
+	// flip config failover on
+	if err := setFailover(home, true); err != nil {
+		t.Fatal(err)
+	}
+	s2, dataURL2 := newStartedGateway(t, home)
+	if _, err := s2.unlock([]byte(pass)); err != nil {
+		t.Fatal(err)
+	}
+	resp = mustPost(t, dataURL2, "/v1/chat/completions", plain, `{"model":"best"}`)
+	data, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failover on: = %d %s, want fallback success", resp.StatusCode, data)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("not JSON: %s", data)
+	}
+	if out["model"] != "mock-small" {
+		t.Fatalf("fallback model = %v, want mock-small", out["model"])
+	}
+}
+
+// newFailingUpstream returns an upstream that always answers with status+body.
+func newFailingUpstream(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(b.Close)
+	return b
+}
+
+// newScopedKey issues a proxy key and returns its plaintext (shown once).
+func newScopedKey(t *testing.T, home, name string, providers []string) string {
+	t.Helper()
+	pk, plain, err := proxykey.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk.Name = name
+	pk.Providers = providers
+	if err := proxykey.NewStore(proxykey.DefaultPath(home)).Add(pk); err != nil {
+		t.Fatal(err)
+	}
+	return plain
+}
+
+func shutdownForTest(s *Server) { s.shutdown("test") }
+
+// setFailover toggles the failover flag in the home's config.toml.
+func setFailover(home string, on bool) error {
+	cfg, err := config.Load(config.Path(home))
+	if err != nil {
+		return err
+	}
+	cfg.Failover = on
+	return config.Save(config.Path(home), cfg)
+}
+
+func TestRedactionInErrors(t *testing.T) {
+	home, pass, _ := newGateway(t)
+	s, dataURL := startGateway(t, home, pass)
+
+	// The mock's plain-fail body echoes a credential-shaped string; the
+	// gateway must redact it before wrapping.
+	if _, err := s.unlock([]byte(pass)); err != nil {
+		t.Fatal(err)
+	}
+	plain := newScopedKey(t, home, "redact-app", []string{"mock"})
+	resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small","__fail":"leak"}`)
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(data), "sk-leaky-credential-999999") {
+		t.Fatalf("upstream error leaked credential: %s", data)
 	}
 }

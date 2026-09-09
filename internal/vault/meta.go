@@ -10,6 +10,7 @@ const PayloadVersion = 1
 type Meta struct {
 	Version   int                     `json:"version"`
 	Providers map[string]ProviderMeta `json:"providers"`
+	Aliases   map[string][]string     `json:"aliases,omitempty"` // name → provider/model failover chain (SPEC 5)
 }
 
 // ProviderMeta is one provider's entry in meta.json (SPEC 3.3).

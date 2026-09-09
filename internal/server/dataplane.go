@@ -2,9 +2,9 @@ package server
 
 // The OpenAI-compatible data plane (SPEC 6.1): downstream clients present a
 // proxy key (Bearer vk-…), requests are routed to the provider named in the
-// model namespace ("openai/gpt-5"), the Authorization header is rewritten to
-// the real credential, and errors are normalized to the OpenAI error shape.
-// Failover chains and aliases arrive with the hardening milestone (SPEC 6.1).
+// model namespace ("openai/gpt-5") or to an alias chain, the Authorization
+// header is rewritten to the real credential, and errors are normalized to
+// the OpenAI error shape (SPEC 6.1).
 import (
 	"bytes"
 	"context"
@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
+	"github.com/ZN9-KYANT/aivault/internal/config"
 	"github.com/ZN9-KYANT/aivault/internal/provider"
+	"github.com/ZN9-KYANT/aivault/internal/redact"
 	"github.com/ZN9-KYANT/aivault/internal/proxykey"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
@@ -48,7 +50,7 @@ func (e *apiError) write(w http.ResponseWriter) {
 }
 
 // dataRoutes builds the OpenAI-compatible data plane (SPEC 6.1). Every route
-// requires a valid proxy key (SPEC 4.4). Aliases + failover: hardening.
+// requires a valid proxy key (SPEC 4.4).
 func (s *Server) dataRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/models", s.withProxyKey(s.handleModels))
@@ -68,7 +70,8 @@ func (s *Server) dataRoutes() http.Handler {
 	return mux
 }
 
-// withProxyKey authenticates the downstream client before the handler runs.
+// withProxyKey authenticates the downstream client and enforces the proxy
+// key's rate/spend limits before the handler runs (SPEC 4.4, 8.8).
 func (s *Server) withProxyKey(next func(http.ResponseWriter, *http.Request, *proxykey.Key)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pk, err := s.authProxyKey(r)
@@ -79,6 +82,10 @@ func (s *Server) withProxyKey(next func(http.ResponseWriter, *http.Request, *pro
 			}
 			_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventAuthFail, ProxyKeyID: id, Outcome: err.Error()})
 			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", err.Error(), "invalid_api_key")
+			return
+		}
+		if aerr := s.checkLimits(pk); aerr != nil {
+			aerr.write(w)
 			return
 		}
 		next(w, r, pk)
@@ -109,6 +116,30 @@ func (s *Server) authProxyKey(r *http.Request) (*proxykey.Key, error) {
 		return found, errors.New("revoked proxy key")
 	}
 	return found, nil
+}
+
+// checkLimits enforces the proxy key's RPM and daily spend cap (SPEC 8.8).
+func (s *Server) checkLimits(pk *proxykey.Key) *apiError {
+	now := time.Now()
+	if pk.RPM > 0 {
+		if ok, retryAfter := s.limiter.allow(pk.ID, pk.RPM, now); !ok {
+			return &apiError{
+				status: http.StatusTooManyRequests, typ: "rate_limit_error",
+				msg: fmt.Sprintf("proxy key %q exceeded %d requests/minute (retry after %.0fs)", pk.Name, pk.RPM, retryAfter.Seconds()),
+				code: "rate_limit_exceeded",
+			}
+		}
+	}
+	if pk.MaxUSDPerDay > 0 {
+		if usd := s.limiter.spendFor(pk.ID, now); usd >= pk.MaxUSDPerDay {
+			return &apiError{
+				status: http.StatusTooManyRequests, typ: "rate_limit_error",
+				msg: fmt.Sprintf("proxy key %q reached its daily spend cap of $%.2f (spent $%.4f today)", pk.Name, pk.MaxUSDPerDay, usd),
+				code: "spend_cap_reached",
+			}
+		}
+	}
+	return nil
 }
 
 // target is the resolved upstream destination for one request.
@@ -162,8 +193,70 @@ func (s *Server) resolveProvider(providerID string, meta *vault.Meta) (*target, 
 	return &target{baseURL: baseURL, cred: p.APIKey.Key, headers: p.APIKey.Headers}, nil
 }
 
+// routeEntry is one hop in the resolved route: a provider and the model name
+// to send upstream (SPEC 5, 6.1).
+type routeEntry struct {
+	providerID string
+	model      string
+}
+
+// resolveRoute maps the request's model to a route: an alias chain (SPEC 5)
+// when the name matches one, else a direct provider/model namespace split.
+// Failover comes only from alias chains (SPEC 6.1, default off).
+func resolveRoute(modelRaw string, meta *vault.Meta, pk *proxykey.Key) ([]routeEntry, bool, *apiError) {
+	if chain, ok := meta.Aliases[modelRaw]; ok && len(chain) > 0 {
+		entries := make([]routeEntry, 0, len(chain))
+		for _, e := range chain {
+			pid, m, err := provider.SplitModel(e)
+			if err != nil {
+				return nil, false, &apiError{
+					status: http.StatusBadRequest, typ: "invalid_request_error",
+					msg: "alias chain entry: " + err.Error(), code: "invalid_alias",
+				}
+			}
+			entries = append(entries, routeEntry{providerID: pid, model: m})
+		}
+		if aerr := scopeCheck(entries, pk); aerr != nil {
+			return nil, false, aerr
+		}
+		return entries, true, nil
+	}
+	pid, m, err := provider.SplitModel(modelRaw)
+	if err != nil {
+		return nil, false, &apiError{
+			status: http.StatusBadRequest, typ: "invalid_request_error",
+			msg:    "model must be namespaced as <provider>/<model> (e.g. openai/gpt-5) or a registered alias",
+			code:   "invalid_model",
+		}
+	}
+	entries := []routeEntry{{providerID: pid, model: m}}
+	if aerr := scopeCheck(entries, pk); aerr != nil {
+		return nil, false, aerr
+	}
+	return entries, false, nil
+}
+
+// scopeCheck requires every provider in the route to be in the proxy key's
+// scope, so a failover chain cannot leak to an out-of-scope provider.
+func scopeCheck(entries []routeEntry, pk *proxykey.Key) *apiError {
+	if len(pk.Providers) == 0 {
+		return nil
+	}
+	for _, e := range entries {
+		if !containsString(pk.Providers, e.providerID) {
+			return &apiError{
+				status: http.StatusForbidden, typ: "invalid_request_error",
+				msg:    fmt.Sprintf("provider %q is not allowed for this proxy key", e.providerID),
+				code:   "provider_not_allowed",
+			}
+		}
+	}
+	return nil
+}
+
 // forward proxies suffix endpoints (chat/completions, responses, embeddings)
-// to the provider named in the model namespace (SPEC 6.1).
+// to the provider named in the model namespace, following alias chains with
+// optional failover on 429/5xx/timeout (SPEC 6.1).
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, suffix string, pk *proxykey.Key) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err != nil {
@@ -176,15 +269,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, suffix string, 
 		return
 	}
 	modelRaw, _ := payload["model"].(string)
-	providerID, modelName, err := splitModel(modelRaw)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
-			"model must be namespaced as <provider>/<model> (e.g. openai/gpt-5)", "invalid_model")
-		return
-	}
-	if len(pk.Providers) > 0 && !containsString(pk.Providers, providerID) {
-		writeOpenAIError(w, http.StatusForbidden, "invalid_request_error",
-			fmt.Sprintf("provider %q is not allowed for this proxy key", providerID), "provider_not_allowed")
+	if modelRaw == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "model is required", "invalid_model")
 		return
 	}
 
@@ -193,25 +279,96 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, suffix string, 
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "load meta: "+err.Error(), "internal_error")
 		return
 	}
-	tgt, aerr := s.resolveProvider(providerID, meta)
+	entries, isAlias, aerr := resolveRoute(modelRaw, meta, pk)
 	if aerr != nil {
 		aerr.write(w)
 		return
 	}
-	if tgt.cred != "" {
-		s.touch() // keyring-using request resets the idle auto-lock (SPEC 4.2)
-	}
-
-	// Rewrite the body: strip the namespace from "model" (SPEC 6.1). The JSON
-	// round-trip stores numbers as float64 — lossless for token counts < 2^53.
-	payload["model"] = modelName
-	outBody, err := json.Marshal(payload)
+	cfg, err := config.Load(s.opts.ConfigPath)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "encode request: "+err.Error(), "invalid_json")
+		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "load config: "+err.Error(), "internal_error")
+		return
+	}
+	// Failover applies only to alias chains and only when enabled (SPEC 6.1:
+	// configurable, default off).
+	failover := isAlias && cfg.Failover && len(entries) > 1
+
+	stream, _ := payload["stream"].(bool)
+	for i, ent := range entries {
+		tgt, raerr := s.resolveProvider(ent.providerID, meta)
+		if raerr != nil {
+			if failover && i < len(entries)-1 {
+				continue
+			}
+			raerr.write(w)
+			return
+		}
+		if tgt.cred != "" {
+			s.touch() // keyring-using request resets the idle auto-lock (SPEC 4.2)
+		}
+
+		// Rewrite the body: the entry's model name (namespace stripped). The
+		// JSON round-trip stores numbers as float64 — lossless for counts < 2^53.
+		payload["model"] = ent.model
+		outBody, err := json.Marshal(payload)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "encode request: "+err.Error(), "invalid_json")
+			return
+		}
+
+		resp, err := s.doUpstream(r, tgt, suffix, outBody, stream)
+		if err != nil {
+			if failover && i < len(entries)-1 {
+				continue
+			}
+			_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventKeyUse, Provider: ent.providerID, ProxyKeyID: pk.ID, Outcome: "upstream-error"})
+			if errors.Is(err, context.DeadlineExceeded) {
+				writeOpenAIError(w, http.StatusGatewayTimeout, "api_error", "provider request timed out", "timeout")
+				return
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "api_error", "provider request failed: "+err.Error(), "upstream_error")
+			return
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			if failover && i < len(entries)-1 && retryableStatus(resp.StatusCode) {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+				resp.Body.Close()
+				continue
+			}
+			_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventKeyUse, Provider: ent.providerID, ProxyKeyID: pk.ID, Outcome: fmt.Sprintf("%d", resp.StatusCode)})
+			s.writeUpstreamError(w, resp)
+			resp.Body.Close()
+			return
+		}
+
+		_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventKeyUse, Provider: ent.providerID, ProxyKeyID: pk.ID, Outcome: fmt.Sprintf("%d", resp.StatusCode)})
+		w.Header().Set("Content-Type", orDefault(resp.Header.Get("Content-Type"), "application/json"))
+		w.WriteHeader(resp.StatusCode)
+		if stream {
+			n := pumpStream(w, resp)
+			resp.Body.Close()
+			s.accountStreamSpend(pk, ent, &cfg.Spend, n)
+		} else {
+			data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody))
+			resp.Body.Close()
+			if rerr != nil {
+				return // headers already sent; nothing sane left to do
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+			_, _ = w.Write(data)
+			s.accountUsageSpend(pk, ent, &cfg.Spend, data)
+		}
 		return
 	}
 
-	stream, _ := payload["stream"].(bool)
+	// Failover exhausted on pre-flight errors; nothing written yet.
+	writeOpenAIError(w, http.StatusBadGateway, "api_error", "all providers in the failover chain failed", "upstream_error")
+}
+
+// doUpstream builds and performs one upstream request. Failover re-uses the
+// caller's context, so client disconnects tear down in-flight providers.
+func (s *Server) doUpstream(r *http.Request, tgt *target, suffix string, outBody []byte, stream bool) (*http.Response, error) {
 	ctx := r.Context()
 	if !stream {
 		// Bounded deadline only for non-streaming requests; streams stay open.
@@ -221,8 +378,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, suffix string, 
 	}
 	out, err := http.NewRequestWithContext(ctx, http.MethodPost, joinURL(tgt.baseURL, suffix), bytes.NewReader(outBody))
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "build upstream request: "+err.Error(), "internal_error")
-		return
+		return nil, err
 	}
 	out.Header.Set("Content-Type", "application/json")
 	if tgt.cred != "" {
@@ -231,87 +387,61 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, suffix string, 
 	for k, v := range tgt.headers {
 		out.Header.Set(k, v)
 	}
-
-	resp, err := s.upstream.Do(out)
-	if err != nil {
-		_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventKeyUse, Provider: providerID, ProxyKeyID: pk.ID, Outcome: "upstream-error"})
-		if errors.Is(err, context.DeadlineExceeded) {
-			writeOpenAIError(w, http.StatusGatewayTimeout, "api_error", "provider request timed out", "timeout")
-			return
-		}
-		writeOpenAIError(w, http.StatusBadGateway, "api_error", "provider request failed: "+err.Error(), "upstream_error")
-		return
-	}
-	defer resp.Body.Close()
-
-	_ = audit.Log(s.auditLog, audit.Entry{
-		Event: audit.EventKeyUse, Provider: providerID, ProxyKeyID: pk.ID,
-		Outcome: fmt.Sprintf("%d", resp.StatusCode),
-	})
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		s.writeUpstreamError(w, resp)
-		return
-	}
-
-	w.Header().Set("Content-Type", orDefault(resp.Header.Get("Content-Type"), "application/json"))
-	w.WriteHeader(resp.StatusCode)
-	if stream {
-		pumpStream(w, resp)
-		return
-	}
-	if resp.ContentLength >= 0 {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
-	}
-	_, _ = io.Copy(w, resp.Body)
+	return s.upstream.Do(out)
 }
 
-// writeUpstreamError normalizes a non-2xx provider response to the OpenAI
-// error JSON shape (SPEC 6.1): already-shaped bodies pass through untouched,
-// anything else is wrapped with a bounded snippet.
-func (s *Server) writeUpstreamError(w http.ResponseWriter, resp *http.Response) {
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody))
-	var probe map[string]json.RawMessage
-	if json.Unmarshal(data, &probe) == nil {
-		if _, has := probe["error"]; has {
-			w.Header().Set("Content-Type", orDefault(resp.Header.Get("Content-Type"), "application/json"))
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(data)
-			return
-		}
-	}
-	msg := strings.TrimSpace(string(data))
-	if msg == "" {
-		msg = resp.Status
-	}
-	if len(msg) > maxErrorSnippet {
-		msg = msg[:maxErrorSnippet] + "…"
-	}
-	typ := "api_error"
-	if resp.StatusCode < 500 {
-		typ = "upstream_request_error"
-	}
-	writeOpenAIError(w, resp.StatusCode, typ, msg, resp.StatusCode)
+// retryableStatus reports whether failover should try the next chain entry.
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
 }
 
-// pumpStream relays an SSE body chunk by chunk, flushing after each write so
-// tokens reach the client live (SPEC 6.1). The upstream request is bound to
-// the client's context, so a disconnect tears down the upstream request.
-func pumpStream(w http.ResponseWriter, resp *http.Response) {
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32*1024)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			w.Write(buf[:n])
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			return // EOF or client/upstream disconnect
+// accountUsageSpend estimates and accrues the request cost for a completed
+// non-streaming response, preferring the upstream usage block (SPEC 8.8).
+func (s *Server) accountUsageSpend(pk *proxykey.Key, ent routeEntry, spend *config.Spend, body []byte) {
+	if pk.MaxUSDPerDay <= 0 {
+		return
+	}
+	in, out := spendPrice(spend, ent.providerID+"/"+ent.model)
+	var u struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	var cost float64
+	if json.Unmarshal(body, &u) == nil && u.Usage.PromptTokens+u.Usage.CompletionTokens > 0 {
+		cost = float64(u.Usage.PromptTokens)/1e6*in + float64(u.Usage.CompletionTokens)/1e6*out
+	} else {
+		cost = float64(len(body)) / 4 / 1e6 * out // char/4 estimation fallback
+	}
+	if cost > 0 {
+		s.limiter.addSpend(pk.ID, cost, time.Now())
+	}
+}
+
+// accountStreamSpend estimates streamed responses by bytes/4 (SSE overhead
+// included) at the output rate; a coarse but monotone cap signal (SPEC 8.8).
+func (s *Server) accountStreamSpend(pk *proxykey.Key, ent routeEntry, spend *config.Spend, bytes int) {
+	if pk.MaxUSDPerDay <= 0 || bytes <= 0 {
+		return
+	}
+	_, out := spendPrice(spend, ent.providerID+"/"+ent.model)
+	cost := float64(bytes) / 4 / 1e6 * out
+	if cost > 0 {
+		s.limiter.addSpend(pk.ID, cost, time.Now())
+	}
+}
+
+// spendPrice returns the USD-per-1M-token estimate for a namespaced model;
+// the first matching prefix in the config table wins (SPEC 8.8).
+func spendPrice(cfg *config.Spend, model string) (in, out float64) {
+	in, out = cfg.InputUSDPer1M, cfg.OutputUSDPer1M
+	for _, mp := range cfg.ModelPrices {
+		if mp.Prefix != "" && strings.HasPrefix(model, mp.Prefix) {
+			return mp.InputUSDPer1M, mp.OutputUSDPer1M
 		}
 	}
+	return in, out
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request, pk *proxykey.Key) {
@@ -422,18 +552,53 @@ func (s *Server) clearModelsCache() {
 	s.modelsMu.Unlock()
 }
 
-// splitModel splits "provider/model" at the FIRST slash; the model part may
-// itself contain slashes (e.g. openrouter/meta-llama/llama-3).
-func splitModel(raw string) (string, string, error) {
-	i := strings.IndexByte(raw, '/')
-	if i <= 0 || i == len(raw)-1 {
-		return "", "", fmt.Errorf("invalid model %q", raw)
+// writeUpstreamError normalizes a non-2xx provider response to the OpenAI
+// error JSON shape (SPEC 6.1): already-shaped bodies pass through untouched,
+// anything else is wrapped with a bounded, redacted snippet (SPEC 8.4).
+func (s *Server) writeUpstreamError(w http.ResponseWriter, resp *http.Response) {
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody))
+	var probe map[string]json.RawMessage
+	if json.Unmarshal(data, &probe) == nil {
+		if _, has := probe["error"]; has {
+			w.Header().Set("Content-Type", orDefault(resp.Header.Get("Content-Type"), "application/json"))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(data)
+			return
+		}
 	}
-	providerID, model := raw[:i], raw[i+1:]
-	if !provider.ValidID(providerID) {
-		return "", "", fmt.Errorf("invalid provider namespace %q", providerID)
+	msg := strings.TrimSpace(redact.String(string(data)))
+	if msg == "" {
+		msg = resp.Status
 	}
-	return providerID, model, nil
+	if len(msg) > maxErrorSnippet {
+		msg = msg[:maxErrorSnippet] + "…"
+	}
+	typ := "api_error"
+	if resp.StatusCode < 500 {
+		typ = "upstream_request_error"
+	}
+	writeOpenAIError(w, resp.StatusCode, typ, msg, resp.StatusCode)
+}
+
+// pumpStream relays an SSE body chunk by chunk, flushing after each write so
+// tokens reach the client live (SPEC 6.1), returning the bytes relayed.
+func pumpStream(w http.ResponseWriter, resp *http.Response) int {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	total := 0
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			total += n
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			return total // EOF or client/upstream disconnect
+		}
+	}
 }
 
 func joinURL(base, suffix string) string {
@@ -463,9 +628,10 @@ type openAIErrorBody struct {
 	Code    any    `json:"code,omitempty"`
 }
 
-// writeOpenAIError renders errors in the OpenAI error JSON shape (SPEC 6.1).
+// writeOpenAIError renders errors in the OpenAI error JSON shape (SPEC 6.1),
+// with every message run through the redaction filter (SPEC 8.4).
 func writeOpenAIError(w http.ResponseWriter, status int, typ, msg string, code any) {
 	writeJSON(w, status, map[string]any{
-		"error": openAIErrorBody{Message: msg, Type: typ, Code: code},
+		"error": openAIErrorBody{Message: redact.String(msg), Type: typ, Code: code},
 	})
 }

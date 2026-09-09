@@ -2,7 +2,9 @@
 package provider
 
 import (
+	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
@@ -47,3 +49,18 @@ func BuiltinByID(id string) (Provider, bool) {
 
 // ValidID reports whether id is a legal provider ID (SPEC 3.2).
 func ValidID(id string) bool { return idPattern.MatchString(id) }
+
+// SplitModel splits "provider/model" at the FIRST slash; the model part may
+// itself contain slashes (e.g. openrouter/meta-llama/llama-3). Used for both
+// data-plane routing (SPEC 6.1) and alias chain parsing (SPEC 5).
+func SplitModel(raw string) (string, string, error) {
+	i := strings.IndexByte(raw, '/')
+	if i <= 0 || i == len(raw)-1 {
+		return "", "", fmt.Errorf("invalid model %q", raw)
+	}
+	providerID, model := raw[:i], raw[i+1:]
+	if !ValidID(providerID) {
+		return "", "", fmt.Errorf("invalid provider namespace %q", providerID)
+	}
+	return providerID, model, nil
+}
