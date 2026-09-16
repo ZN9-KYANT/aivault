@@ -17,6 +17,7 @@ import (
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
 	"github.com/ZN9-KYANT/aivault/internal/server"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
+	"github.com/ZN9-KYANT/aivault/internal/version"
 )
 
 func newInitCmd() *cobra.Command {
@@ -187,6 +188,7 @@ func newStatusCmd() *cobra.Command {
 func runStatus(cmd *cobra.Command, _ []string) error {
 	home := homeDir(cmd)
 	fmt.Printf("home: %s\n", home)
+	fmt.Printf("version: %s\n", version.Version)
 
 	cfgPath := config.Path(home)
 	if _, err := os.Stat(cfgPath); err != nil {

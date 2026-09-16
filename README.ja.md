@@ -81,7 +81,8 @@ aivault lock
 ## CLI リファレンス
 
 グローバルフラグ: `--home <dir>` で `~/.aivault` の代わりのホームを指定
-(テスト用)。シークレットは隠蔽プロンプト、`--key-stdin`、
+(テスト用)。現在のリリース: **v1.0.0** — `aivault version` (または
+`aivault --version`) で表示します。シークレットは隠蔽プロンプト、`--key-stdin`、
 `$AIVAULT_<PROVIDER>_KEY` (大文字のプロバイダー ID、警告を表示) のいずれかで
 のみ受け付けます。**コマンドライン引数では絶対に渡しません。**
 

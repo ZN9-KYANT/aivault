@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ZN9-KYANT/aivault/internal/vault"
+	"github.com/ZN9-KYANT/aivault/internal/version"
 )
 
 // NewRoot builds the full command tree.
@@ -18,12 +19,13 @@ func NewRoot() *cobra.Command {
 			"serves them through an OpenAI-compatible gateway via one-time proxy keys.\n" +
 			"See SPEC.md for the full design.",
 		SilenceUsage: true,
+		Version:      version.Version,
 	}
 	root.PersistentFlags().String("home", "", "aivault home directory (default ~/.aivault)")
 	root.AddCommand(
 		newInitCmd(), newServeCmd(), newUnlockCmd(), newLockCmd(), newStatusCmd(), newPasswdCmd(),
 		newKeysCmd(), newProxyKeyCmd(), newProvidersCmd(), newAliasCmd(),
-		newBackupCmd(), newRestoreCmd(), newAuditCmd(),
+		newBackupCmd(), newRestoreCmd(), newAuditCmd(), newVersionCmd(),
 	)
 	return root
 }

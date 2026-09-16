@@ -80,6 +80,7 @@ aivault lock
 ## CLI reference
 
 Global flag: `--home <dir>` overrides the `~/.aivault` home (used for tests).
+Current release: **v1.0.0** — print with `aivault version` (or `aivault --version`).
 Secrets are only ever accepted via hidden prompt, `--key-stdin`, or
 `$AIVAULT_<PROVIDER>_KEY` (uppercase provider id, prints a warning) — never as
 a command-line argument.
