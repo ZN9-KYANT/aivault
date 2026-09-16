@@ -35,8 +35,9 @@ func newProvidersCmd() *cobra.Command {
 	}
 
 	models := &cobra.Command{
-		Use:   "models",
-		Short: "Fetch and list live /models for enabled OpenAI-compatible providers",
+		Use:   "models [provider]",
+		Short: "Fetch and list live /models — all enabled providers, or one (full catalog)",
+		Args:  cobra.MaximumNArgs(1),
 		RunE:  runProvidersModels,
 	}
 	models.Flags().String("provider", "", "limit to one provider ID")
@@ -191,20 +192,43 @@ func containsID(list []string, v string) bool {
 }
 
 // runProvidersModels lists live /models per enabled OpenAI-compatible
-// provider (SPEC 5: `providers models`). Requires the master passphrase; no
-// server involved.
-func runProvidersModels(cmd *cobra.Command, _ []string) error {
+// provider (SPEC 5: `providers models`). Without an argument it prints the
+// summary table across all providers; with one argument (`providers models
+// <id>`, or the legacy --provider flag) it lists that provider's FULL model
+// catalog. Requires the master passphrase; no server involved.
+func runProvidersModels(cmd *cobra.Command, args []string) error {
 	only, _ := cmd.Flags().GetString("provider")
+	if len(args) > 0 {
+		if only != "" && only != args[0] {
+			return fmt.Errorf("providers models: give the provider either as an argument or via --provider, not both")
+		}
+		only = args[0]
+	}
 	targets, pass, err := providersTargets(cmd, only)
 	if err != nil {
 		return err
 	}
 	defer kdf.Zeroize(pass)
 	if len(targets) == 0 {
+		if only != "" {
+			return fmt.Errorf("provider %q: no decrypted target (vault file missing?)", only)
+		}
 		fmt.Println("No enabled OpenAI-compatible providers with stored keys.")
 		return nil
 	}
 	pc := newProviderClient()
+	if only != "" {
+		t := targets[0]
+		_, list, err := pc.probe(t.baseURL, t.cred)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s (%s): %d models\n", t.id, t.baseURL, len(list))
+		for _, id := range list {
+			fmt.Println(id)
+		}
+		return nil
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "PROVIDER\tMODELS\tFIRST MODELS")
 	for _, t := range targets {

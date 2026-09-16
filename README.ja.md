@@ -129,13 +129,14 @@ aivault keys rotate nvidia                         # プロバイダー設定は
 | `aivault providers list` | `meta.json` から登録済みプロバイダーを表示 (アンロック不要) |
 | `aivault providers add <id> --base-url <url>` | カスタムプロバイダーを登録 (組み込み ID は予約済み) |
 | `aivault providers test <id>` | 保存済みクレデンシャルで `GET /models` を実行。モデル数を報告 |
-| `aivault providers models` | 有効な OpenAI 互換プロバイダーごとにモデルカタログを取得 |
+| `aivault providers models [provider]` | モデルカタログを取得 — 全プロバイダーの概要表、または 1 つのプロバイダーの**完全な一覧** |
 
 ```bash
 aivault providers add myprovider --base-url https://api.myprovider.com/v1
 aivault keys add myprovider
 aivault providers test nvidia        # "nvidia: OK — https://… reachable, 82 models"
-aivault providers models             # プロバイダー横断のモデルカタログ
+aivault providers models             # 全プロバイダーの概要表 (各 3 モデルのサンプル)
+aivault providers models nvidia      # 1 プロバイダーの完全なカタログ (1 行 1 モデル)
 ```
 
 登録済みだが**未キー登録**のカスタムプロバイダーは kind `none` になり、

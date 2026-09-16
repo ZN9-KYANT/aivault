@@ -128,13 +128,14 @@ aivault keys rotate nvidia                         # swap the key, keep the prov
 | `aivault providers list` | Registered providers from `meta.json` (no unlock needed) |
 | `aivault providers add <id> --base-url <url>` | Register a custom provider (built-in IDs are reserved) |
 | `aivault providers test <id>` | Live `GET /models` with the stored credential; reports model count |
-| `aivault providers models` | Live model catalog per enabled OpenAI-compatible provider |
+| `aivault providers models [provider]` | Live model catalog — summary table across all providers, or the **full list** for one |
 
 ```bash
 aivault providers add myprovider --base-url https://api.myprovider.com/v1
 aivault keys add myprovider
 aivault providers test nvidia        # "nvidia: OK — https://… reachable, 82 models"
-aivault providers models             # model catalogs across providers
+aivault providers models             # summary table across providers (3-model sample each)
+aivault providers models nvidia      # full catalog for one provider, one id per line
 ```
 
 A registered custom provider that has **not** been keyed yet becomes kind
