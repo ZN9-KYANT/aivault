@@ -18,6 +18,7 @@ import (
 	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
 	"github.com/ZN9-KYANT/aivault/internal/provider"
+	"github.com/ZN9-KYANT/aivault/internal/redact"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
 
@@ -85,8 +86,8 @@ func (pc *providerClient) probe(baseURL, cred string) (int, []string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
-		return resp.StatusCode, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return resp.StatusCode, nil, probeUpstreamError(resp.StatusCode, cred, raw)
 	}
 	var parsed struct {
 		Data []struct {
@@ -101,6 +102,24 @@ func (pc *providerClient) probe(baseURL, cred string) (int, []string, error) {
 		ids = append(ids, m.ID)
 	}
 	return len(ids), ids, nil
+}
+
+// probeUpstreamError builds a redacted error for a failed /models probe: it
+// caps and flattens the upstream body and scrubs credential-shaped strings
+// (SPEC 8.4) so the provider's own error text reaches the user without
+// leaking the stored key.
+func probeUpstreamError(status int, cred string, body []byte) error {
+	redact.Register([]string{cred})
+	msg := strings.TrimSpace(redact.String(string(body)))
+	if msg != "" {
+		msg = strings.Join(strings.Fields(msg), " ")
+		const max = 240
+		if len(msg) > max {
+			msg = msg[:max] + "…"
+		}
+		return fmt.Errorf("HTTP %d: %s", status, msg)
+	}
+	return fmt.Errorf("HTTP %d", status)
 }
 
 // providerTarget is one decrypted provider ready for a manual probe.
@@ -259,6 +278,7 @@ func runProvidersTest(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s: OK — %s reachable, %d models\n", id, p.APIKey.BaseURL, count)
 	return nil
 }
+
 // user-defined base URL served through the gateway. Builtin IDs are reserved.
 // Registration stores no secret; keys arrive later via aivault keys add (kind
 // apikey) or never for credential-free local servers (kind none, SPEC 3.4).
