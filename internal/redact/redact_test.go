@@ -8,12 +8,12 @@ import (
 func TestPatterns(t *testing.T) {
 	cases := map[string]string{
 		"Authorization: Bearer vk-0123456789abcdef0123456789abcdef0123456789abcdef01234567": "Authorization: Bearer [REDACTED]",
-		"key vk-0123456789abcdef0123456789abcdef0123456789abcdef":             "key vk-[REDACTED]",
+		"key vk-0123456789abcdef0123456789abcdef0123456789abcdef":                           "key vk-[REDACTED]",
 		"nvapi-SUPERSECRETKEY1234567890abcdef":                                              "nvapi-[REDACTED]",
 		"sk-proj-abcdefghijklmnop1234":                                                      "sk-[REDACTED]",
 		"AIzaSyA-0123456789abcdefghijklmnopqrstu":                                           "AIza[REDACTED]",
-		"normal text stays":                                                                 "normal text stays",
-		"short sk-x stays":                                                                  "short sk-x stays",
+		"normal text stays": "normal text stays",
+		"short sk-x stays":  "short sk-x stays",
 	}
 	for in, want := range cases {
 		if got := String(in); got != want {
