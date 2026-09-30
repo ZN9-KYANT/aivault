@@ -412,6 +412,114 @@ func TestCredentialFreeRouting(t *testing.T) {
 	}
 }
 
+func TestModelsEndpointAliases(t *testing.T) {
+	home, pass, plain := newGateway(t)
+	// Aliases: in-scope single, in-scope chain, chain with an unregistered
+	// provider (must be hidden). Written to meta.json after setup — the
+	// handler reloads meta per request.
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Aliases = map[string][]string{
+		"zeta":  {"mock/mock-small"},
+		"alpha": {"mockfree/mock-small", "mock/mock-large"},
+		"bad":   {"nosuch/small"},
+	}
+	if err := st.SaveMeta(meta); err != nil {
+		t.Fatal(err)
+	}
+	_ = pass
+	_, dataURL := startGateway(t, home, pass)
+
+	req, _ := http.NewRequest("GET", dataURL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var out struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("parse models: %s", data)
+	}
+	var aliases []string
+	for _, d := range out.Data {
+		if d.OwnedBy == "alias" {
+			aliases = append(aliases, d.ID)
+		}
+	}
+	got := strings.Join(aliases, ",")
+	// Sorted, scope-clean: unregistered-provider chain hidden, both
+	// in-scope aliases present exactly once.
+	if got != "alpha,zeta" {
+		t.Fatalf("alias docs = %q (full body %s)", got, data)
+	}
+}
+
+func TestModelsEndpointAliasesScopedOut(t *testing.T) {
+	home, pass, _ := newGateway(t)
+	st := vault.NewStore(home)
+	meta, err := st.LoadMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Aliases = map[string][]string{
+		"in-scope":  {"mock/mock-small"},
+		"out-scope": {"mockfree/mock-small"},
+	}
+	if err := st.SaveMeta(meta); err != nil {
+		t.Fatal(err)
+	}
+	// Second key scoped ONLY to "mock": must not see the mockfree alias.
+	pk, plainMock, err := proxykey.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk.Name = "mockonly"
+	pk.Providers = []string{"mock"}
+	if err := proxykey.NewStore(proxykey.DefaultPath(home)).Add(pk); err != nil {
+		t.Fatal(err)
+	}
+	_ = pass
+	_, dataURL := startGateway(t, home, pass)
+
+	req, _ := http.NewRequest("GET", dataURL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+plainMock)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var out struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("parse models: %s", data)
+	}
+	for _, d := range out.Data {
+		if d.OwnedBy == "alias" {
+			if d.ID == "out-scope" {
+				t.Fatalf("alias outside proxy-key scope leaked: %s", data)
+			}
+			if d.ID != "in-scope" {
+				t.Fatalf("unexpected alias doc %q", d.ID)
+			}
+		}
+	}
+}
+
 func TestUnknownEndpointOpenAIShape(t *testing.T) {
 	home, _, plain := newGateway(t)
 	_, dataURL := newStartedGateway(t, home)

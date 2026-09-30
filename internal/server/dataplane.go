@@ -13,14 +13,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/config"
 	"github.com/ZN9-KYANT/aivault/internal/provider"
-	"github.com/ZN9-KYANT/aivault/internal/redact"
 	"github.com/ZN9-KYANT/aivault/internal/proxykey"
+	"github.com/ZN9-KYANT/aivault/internal/redact"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
 
@@ -125,7 +126,7 @@ func (s *Server) checkLimits(pk *proxykey.Key) *apiError {
 		if ok, retryAfter := s.limiter.allow(pk.ID, pk.RPM, now); !ok {
 			return &apiError{
 				status: http.StatusTooManyRequests, typ: "rate_limit_error",
-				msg: fmt.Sprintf("proxy key %q exceeded %d requests/minute (retry after %.0fs)", pk.Name, pk.RPM, retryAfter.Seconds()),
+				msg:  fmt.Sprintf("proxy key %q exceeded %d requests/minute (retry after %.0fs)", pk.Name, pk.RPM, retryAfter.Seconds()),
 				code: "rate_limit_exceeded",
 			}
 		}
@@ -134,7 +135,7 @@ func (s *Server) checkLimits(pk *proxykey.Key) *apiError {
 		if usd := s.limiter.spendFor(pk.ID, now); usd >= pk.MaxUSDPerDay {
 			return &apiError{
 				status: http.StatusTooManyRequests, typ: "rate_limit_error",
-				msg: fmt.Sprintf("proxy key %q reached its daily spend cap of $%.2f (spent $%.4f today)", pk.Name, pk.MaxUSDPerDay, usd),
+				msg:  fmt.Sprintf("proxy key %q reached its daily spend cap of $%.2f (spent $%.4f today)", pk.Name, pk.MaxUSDPerDay, usd),
 				code: "spend_cap_reached",
 			}
 		}
@@ -155,22 +156,22 @@ func (s *Server) resolveProvider(providerID string, meta *vault.Meta) (*target, 
 	if !ok {
 		return nil, &apiError{
 			status: http.StatusBadRequest, typ: "invalid_request_error",
-			msg:    fmt.Sprintf("unknown provider %q", providerID),
-			code:   "unknown_provider",
+			msg:  fmt.Sprintf("unknown provider %q", providerID),
+			code: "unknown_provider",
 		}
 	}
 	if !pm.Enabled {
 		return nil, &apiError{
 			status: http.StatusBadRequest, typ: "invalid_request_error",
-			msg:    fmt.Sprintf("provider %q is disabled", providerID),
-			code:   "provider_disabled",
+			msg:  fmt.Sprintf("provider %q is disabled", providerID),
+			code: "provider_disabled",
 		}
 	}
 	// Native (non-OpenAI-wire) builtins need translation shims (SPEC 5, 10).
 	if p, isBuiltin := provider.BuiltinByID(providerID); isBuiltin && !p.OpenAICompat {
 		return nil, &apiError{
 			status: http.StatusBadRequest, typ: "invalid_request_error",
-			msg: fmt.Sprintf("provider %q is not OpenAI wire-compatible; translation shims arrive in v1.1", providerID),
+			msg:  fmt.Sprintf("provider %q is not OpenAI wire-compatible; translation shims arrive in v1.1", providerID),
 			code: "unsupported_provider",
 		}
 	}
@@ -225,8 +226,8 @@ func resolveRoute(modelRaw string, meta *vault.Meta, pk *proxykey.Key) ([]routeE
 	if err != nil {
 		return nil, false, &apiError{
 			status: http.StatusBadRequest, typ: "invalid_request_error",
-			msg:    "model must be namespaced as <provider>/<model> (e.g. openai/gpt-5) or a registered alias",
-			code:   "invalid_model",
+			msg:  "model must be namespaced as <provider>/<model> (e.g. openai/gpt-5) or a registered alias",
+			code: "invalid_model",
 		}
 	}
 	entries := []routeEntry{{providerID: pid, model: m}}
@@ -246,8 +247,8 @@ func scopeCheck(entries []routeEntry, pk *proxykey.Key) *apiError {
 		if !containsString(pk.Providers, e.providerID) {
 			return &apiError{
 				status: http.StatusForbidden, typ: "invalid_request_error",
-				msg:    fmt.Sprintf("provider %q is not allowed for this proxy key", e.providerID),
-				code:   "provider_not_allowed",
+				msg:  fmt.Sprintf("provider %q is not allowed for this proxy key", e.providerID),
+				code: "provider_not_allowed",
 			}
 		}
 	}
@@ -472,8 +473,45 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request, pk *proxyk
 			docs = append(docs, modelDoc{ID: id2, Object: "model", OwnedBy: id})
 		}
 	}
+	// Surface gateway aliases (SPEC 5) next to the real catalogs: virtual
+	// names resolve to failover chains before namespace splitting, so the
+	// client's model picker can offer provider switches with zero client
+	// config changes. Out-of-scope aliases stay hidden (scope matches the
+	// per-chain enforcement in routing).
+	scopeSet := make(map[string]struct{}, len(scope))
+	for _, id := range scope {
+		scopeSet[id] = struct{}{}
+	}
+	for _, name := range aliasNamesInScope(meta.Aliases, scopeSet) {
+		docs = append(docs, modelDoc{ID: name, Object: "model", OwnedBy: "alias"})
+	}
 	_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventKeyUse, ProxyKeyID: pk.ID, Outcome: "models"})
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": docs})
+}
+
+// aliasNamesInScope returns alias names whose entire failover chain resolves
+// to providers inside the given scope set. Sorted for deterministic output.
+func aliasNamesInScope(aliases map[string][]string, scope map[string]struct{}) []string {
+	names := make([]string, 0, len(aliases))
+	for name, chain := range aliases {
+		ok := len(chain) > 0
+		for _, ent := range chain {
+			prov, _, err := provider.SplitModel(ent)
+			if err != nil {
+				ok = false
+				break
+			}
+			if _, allowed := scope[prov]; !allowed {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // modelsFor returns provider-namespaced model IDs ("openai/gpt-5") from the
