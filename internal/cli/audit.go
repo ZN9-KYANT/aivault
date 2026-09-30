@@ -22,6 +22,7 @@ func newAuditCmd() *cobra.Command {
 	}
 	cmd.Flags().Int("tail", 50, "show the last N entries")
 	cmd.Flags().Bool("json", false, "print raw JSONL entries")
+	cmd.Flags().Bool("verify", false, "verify the tamper-evident hash chain (full log; non-zero exit on tamper)")
 	return cmd
 }
 
@@ -31,7 +32,19 @@ func runAudit(cmd *cobra.Command, _ []string) error {
 		n = 50
 	}
 	asJSON, _ := cmd.Flags().GetBool("json")
-
+	verify, _ := cmd.Flags().GetBool("verify")
+	if verify {
+		res, err := audit.Verify(auditPath(homeDir(cmd)))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("audit chain: %d entries (%d chained, %d legacy)\n", res.Entries, res.ChainLen, res.Legacy)
+		if res.OK {
+			fmt.Println("audit chain: OK (tamper-evident chain intact)")
+			return nil
+		}
+		return fmt.Errorf("audit chain: BROKEN — %s", res.Detail)
+	}
 	entries, err := readAuditTail(homeDir(cmd), n)
 	if err != nil {
 		return err
