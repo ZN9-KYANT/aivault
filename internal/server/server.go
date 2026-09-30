@@ -21,8 +21,8 @@ import (
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/config"
-	"github.com/ZN9-KYANT/aivault/internal/keyring"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
+	"github.com/ZN9-KYANT/aivault/internal/keyring"
 	"github.com/ZN9-KYANT/aivault/internal/redact"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
@@ -58,7 +58,7 @@ type Server struct {
 	autoLockMins int
 	lastActive   time.Time // last request that used the keyring (SPEC 4.2)
 
-	upstream    *http.Client            // provider requests (SPEC 6.1)
+	upstream    *http.Client // provider requests (SPEC 6.1)
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelsEntry // provider → cached /models (SPEC 5)
 	limiter     *limiter               // per-proxy-key rate + spend (SPEC 8.8)
@@ -94,6 +94,9 @@ func SocketPath(home string) string { return filepath.Join(home, "aivault.sock")
 // OpenAI-compatible data plane on 127.0.0.1:Port (SPEC 4.2, 4.3, 6.1, 6.2):
 // the keyring is zeroized and sockets removed on any exit path.
 func (s *Server) Run() error {
+	if err := disableCoreDumps(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not disable core dumps: %v\n", err)
+	}
 	ln, err := s.listen()
 	if err != nil {
 		return err
