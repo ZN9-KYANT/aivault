@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
+	"github.com/ZN9-KYANT/aivault/internal/egress"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
 	"github.com/ZN9-KYANT/aivault/internal/provider"
 	"github.com/ZN9-KYANT/aivault/internal/redact"
@@ -66,7 +68,13 @@ func newProvidersCmd() *cobra.Command {
 type providerClient struct{ client *http.Client }
 
 func newProviderClient() *providerClient {
-	return &providerClient{client: &http.Client{Timeout: 30 * time.Second}}
+	c := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: egress.Guarded((&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext),
+		},
+	}
+	return &providerClient{client: c}
 }
 
 // probe fetches <base>/models and returns the model count and ids, or an
@@ -121,6 +129,42 @@ func probeUpstreamError(status int, cred string, body []byte) error {
 		return fmt.Errorf("HTTP %d: %s", status, msg)
 	}
 	return fmt.Errorf("HTTP %d", status)
+}
+
+// setEgress pins the probe HTTP client to the hosts of the vault's
+// registered providers (meta.json) plus this command's targets — the probe
+// must not be able to send a credential anywhere else (Batch B).
+func setEgressFromTargets(home string, targets []providerTarget, allow bool) {
+	if !allow {
+		return
+	}
+	meta, err := vault.NewStore(home).LoadMeta()
+	var hosts []string
+	if err == nil {
+		for _, pm := range meta.Providers {
+			if h, err := hostOfProbes(pm.BaseURL); err == nil && h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+	}
+	for _, t := range targets {
+		if h, err := hostOfProbes(t.baseURL); err == nil && h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	if err := egress.SetAllowlist(hosts); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: egress allowlist: %v\n", err)
+	}
+}
+
+// hostOfProbes extracts the lowercase hostname of a base URL (CLI probe
+// side; the server keeps its own copy in internal/server).
+func hostOfProbes(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return u.Hostname(), nil
 }
 
 // providerTarget is one decrypted provider ready for a manual probe.
@@ -179,6 +223,7 @@ func providersTargets(cmd *cobra.Command, only string) ([]providerTarget, []byte
 		}
 		out = append(out, providerTarget{id: id, baseURL: p.APIKey.BaseURL, cred: p.APIKey.Key})
 	}
+	setEgressFromTargets(home, out, cfg.EgressAllowlist)
 	return out, pass, nil
 }
 
@@ -287,6 +332,7 @@ func runProvidersTest(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("vault: no API key payload for %q", id)
 	}
 
+	setEgressFromTargets(home, []providerTarget{{id: id, baseURL: p.APIKey.BaseURL}}, cfg.EgressAllowlist)
 	pc := newProviderClient()
 	count, _, err := pc.probe(p.APIKey.BaseURL, p.APIKey.Key)
 	outcome := fmt.Sprintf("%d", count)

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/config"
+	"github.com/ZN9-KYANT/aivault/internal/egress"
 	"github.com/ZN9-KYANT/aivault/internal/kdf"
 	"github.com/ZN9-KYANT/aivault/internal/keyring"
 	"github.com/ZN9-KYANT/aivault/internal/redact"
@@ -29,12 +31,14 @@ import (
 
 // Options configure the gateway (SPEC 6).
 type Options struct {
-	Home         string // aivault home: vault files + audit log
-	ConfigPath   string // config.toml (may be overridden by serve --config)
-	SocketPath   string // admin unix socket, e.g. ~/.aivault/aivault.sock
-	Port         int    // data-plane port, bound to 127.0.0.1 only (SPEC 6.1, 8.7)
-	DataPlane    bool   // serve the OpenAI-compatible /v1 data plane on Port
-	AutoLockMins int    // keyring auto-lock idle timeout; 0 disables (SPEC 4.2)
+	Home            string // aivault home: vault files + audit log
+	ConfigPath      string // config.toml (may be overridden by serve --config)
+	SocketPath      string // admin unix socket, e.g. ~/.aivault/aivault.sock
+	Port            int    // data-plane port, bound to 127.0.0.1 only (SPEC 6.1, 8.7)
+	DataPlane       bool   // serve the OpenAI-compatible /v1 data plane on Port
+	AutoLockMins    int    // keyring auto-lock idle timeout; 0 disables (SPEC 4.2)
+	EgressAllowlist bool   // pin upstream dials to registered provider hosts (Batch B)
+	AuthMaxFailures int    // per-IP auth-failure window on the data plane; 0 disables
 }
 
 // Status is the admin-plane status document (SPEC 6.2).
@@ -78,7 +82,7 @@ func New(opts Options) *Server {
 			// Non-streaming requests apply a context deadline instead.
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
-				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				DialContext:           egress.Guarded((&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext),
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 120 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
@@ -96,6 +100,11 @@ func SocketPath(home string) string { return filepath.Join(home, "aivault.sock")
 func (s *Server) Run() error {
 	if err := disableCoreDumps(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not disable core dumps: %v\n", err)
+	}
+	if s.opts.EgressAllowlist {
+		if n := s.refreshEgress(nil); n >= 0 {
+			fmt.Fprintf(os.Stderr, "egress allowlist: on (%d registered host(s))\n", n)
+		}
 	}
 	ln, err := s.listen()
 	if err != nil {
@@ -300,8 +309,60 @@ func (s *Server) unlock(passphrase []byte) (int, error) {
 	s.ring.Unlock(creds) // takes ownership; zeroizes any previous contents (SPEC 4.2)
 	s.clearModelsCache() // cached /models were fetched under possibly-rotated keys
 	s.registerSecrets(creds)
+	if s.opts.EgressAllowlist {
+		s.refreshEgress(creds) // add payload base URLs (may override meta)
+	}
 	s.touch()
 	return n, nil
+}
+
+// refreshEgress rebuilds the upstream host allowlist from the meta.json
+// base URLs plus any decrypted payload base URLs (payloads may override
+// meta). When creds is non-nil it is called right after a successful
+// unlock; nil creds means server startup (meta only). A malformed URL is
+// skipped with a warning — the egress guard will then also refuse dials
+// to it, which is the safe default.
+func (s *Server) refreshEgress(creds map[string]*vault.Payload) int {
+	hosts, nMeta := egressHostsFromMeta(s.opts.Home)
+	for _, p := range creds {
+		if p == nil || p.APIKey == nil || p.APIKey.BaseURL == "" {
+			continue
+		}
+		if h, err := hostOf(p.APIKey.BaseURL); err == nil && h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	if err := egress.SetAllowlist(hosts); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: egress allowlist: %v\n", err)
+		return -1
+	}
+	return nMeta + len(creds)
+}
+
+// egressHostsFromMeta reads every registered provider's base URL host from
+// meta.json (including disabled and none-kind providers — they are allowed
+// hosts by definition if they were registered).
+func egressHostsFromMeta(home string) ([]string, int) {
+	meta, err := vault.NewStore(home).LoadMeta()
+	if err != nil {
+		return nil, -1
+	}
+	var hosts []string
+	for _, pm := range meta.Providers {
+		if h, err := hostOf(pm.BaseURL); err == nil && h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts, len(hosts)
+}
+
+// hostOf extracts the lowercase hostname of a base URL.
+func hostOf(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return u.Hostname(), nil
 }
 
 // decryptAll decrypts every enabled apikey provider file. On error it
