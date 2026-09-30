@@ -81,7 +81,7 @@ aivault lock
 ## CLI リファレンス
 
 グローバルフラグ: `--home <dir>` で `~/.aivault` の代わりのホームを指定
-(テスト用)。現在のリリース: **v1.1.0** — `aivault version` (または
+(テスト用)。現在のリリース: **v1.2.0** — `aivault version` (または
 `aivault --version`) で表示します。シークレットは隠蔽プロンプト、`--key-stdin`、
 `$AIVAULT_<PROVIDER>_KEY` (大文字のプロバイダー ID、警告を表示) のいずれかで
 のみ受け付けます。**コマンドライン引数では絶対に渡しません。**
@@ -203,6 +203,10 @@ vault はバックアップ時のパスフレーズを使います。監査イ�
 `lock`、`key.add`、`key.remove`、`key.rotate`、`key.use`、`proxykey.create`、
 `provider.add`、`passwd`、`auth.fail`。
 
+`aivault doctor` で 1 コマンドのヘルスレポートを取得できます (設定・
+meta/ファイル整合・権限・プロキシキー・監査チェーン・キー経過・ゲートウェイ
+— アンロック不要。FAIL 検出時は非ゼロで終了)。
+
 ## ゲートウェイ API
 
 ベース URL: `http://127.0.0.1:8317` (ループバック限定。非ループバック
@@ -263,6 +267,8 @@ port = 8317
 auto_lock_minutes = 15
 failover = false          # 429/5xx/タイムアウト時に次のエイリアスチェーンを試行
 key_max_age_days = 90     # 保存済みキーが古すぎる場合に status で警告 (0 = 無効)
+egress_allowlist = true   # 上流ダイヤルを登録済みプロバイダーのホストに固定
+auth_max_failures = 20    # データプレーンの IP 別認証失敗レート制限 (0 = 無効)
 
 [spend]                   # プロキシキー支出上限のコスト概算
 input_usd_per_1m = 0.5
@@ -294,6 +300,13 @@ aivault が管理するため手動編集しないでください。
 - `.gitignore` が `*.age`、`*.key`、`.env` をブロック。OAuth は意図的に
   非対応 (静的 API キーのみ)。
 - サーバー起動時にコアダンプを無効化 (unix `RLIMIT_CORE=0`)。
+- **エグレス許可リスト** — 上流接続を登録済みプロバイダーのホスト名にダイヤル
+  レベルで固定 (リダイレクトも再検証)。改ざんされた設定が本物のキーを不正
+  サーバーへ持ち出すことを防ぎます。`egress_allowlist = true` (既定)。
+- **起動時の権限検証** — vault ファイルにグループ/他人の権限がある場合、
+  `serve`/`unlock`/`doctor` は実行を拒否します (POSIX。Windows は対象外)。
+- **総当たり防御** — データプレーンの認証失敗をピア IP ごとにウィンドウ集計し、
+  `auth_max_failures` (既定 20/分) を超えると以後の試行に 429 を返します。
 - CI は gofmt クリーンなビルド、`go vet`、テスト、`staticcheck`、
   `govulncheck`、gitleaks シークレットスキャンを実行します。
 

@@ -7,19 +7,64 @@ Japanese version of the docs: [README.ja.md](README.ja.md).
 
 ## [Unreleased]
 
-Planned (Batch B, learned from the pi-llm-gateway comparison — see
+Planned backlog (learned from the pi-llm-gateway comparison — see
 `HANDOFF.md` session notes):
 
-- Egress allowlist: pin upstream connections to configured provider domains
-  (anti-exfiltration on config tampering)
-- Startup permission verification for the vault home and files
-- Per-IP auth-failure limiting (`auth_max_failures`)
-- `aivault doctor`: one-command health report (config, meta/file agreement,
-  permissions, audit-chain verification, key ages)
+- memguard-protected keyring (SPEC 8.3) on top of the existing core-dump
+  hardening
+- TLS/mTLS for non-loopback binds (SPEC 8.7), paired with the brute-force
+  guard's multi-machine deployment use case
+- Optional headless identity unlock (v1.2 debate: age X25519 recipient with
+  identity from file/env/secret-manager command)
+- Native anthropic/gemini translation shims (SPEC 10)
 
-Later backlog: memguard-protected keyring (SPEC 8.3), TLS/mTLS for
-non-loopback binds (SPEC 8.7), optional headless identity unlock (v1.2),
-native anthropic/gemini translation shims (SPEC 10).
+## [v1.2.0] — 2026-09-30
+
+Batch B, applying the remaining quick-to-mid hardening lessons from the
+[pi-llm-gateway](https://github.com/trork-code/pi-llm-gateway) comparison.
+
+### Added
+
+- **Egress allowlist** (`b94371d`-style feature, new commit) — new
+  `internal/egress`: upstream provider connections are pinned at the dial
+  layer to the hostnames of registered providers (from `meta.json` plus any
+  overriding decrypted payload base URLs, refreshed at server start and on
+  each unlock). HTTP redirects are re-validated because every dial goes
+  through the guard, and the CLI's `providers test`/`providers models`
+  probes are pinned the same way. A tampered or rogue base URL can no
+  longer exfiltrate a live credential. New config knob
+  `egress_allowlist` (default `true`). Tests: block/allow/redirect
+  re-validation/disable/sanitize state, plus a gateway-level
+  exfiltration-block test.
+- **Startup permission verification** — `vault.CheckPerms` (POSIX;
+  documented no-op on Windows where Stat cannot see NTFS ACLs) refuses to
+  `serve`, `unlock`, or pass `doctor` when the vault home, its files, or
+  the `vault/` subtree carry group/world permissions. Error output names
+  each offending path with a chmod hint. (`permissions_unix.go` + `_windows.go`)
+- **Brute-force guard** — failed data-plane authentications are counted per
+  peer IP in a rolling one-minute window; past `auth_max_failures` (new
+  config knob, default 20, `0` disables) further attempts receive
+  `429 auth_rate_limited` (OpenAI shape) *before* further key checks —
+  including otherwise-valid keys — until the window drains. Audited as
+  `auth.fail` (backoff events included). Tests: exact threshold, valid-key
+  backoff, disabled mode.
+- **`aivault doctor`** — one-command vault health report, no unlock needed
+  (the analogue of pi-llm-gateway's `-check` preflight): config parse +
+  knobs, meta/vault-file agreement (dangling entries, ghost files), file
+  permissions, proxy keys (active/revoked), audit chain verification with
+  entry counts, key ages vs `key_max_age_days`, and the live gateway state.
+  `PASS`/`WARN`/`FAIL` verdict line; FAIL exits non-zero for scripts.
+
+### Changed
+
+- `aivault serve` prints the egress-allowlist state at startup and verifies
+  file permissions before listeners come up.
+
+### Docs
+
+- README (EN + JA): `doctor` in the backup/audit section, the two new
+  config knobs in the config reference, and egress/permissions/brute-force
+  in the security model. CHANGELOG entries for this release.
 
 ## [v1.1.0] — 2026-09-30
 
@@ -147,6 +192,7 @@ lock → 503, revoke → 401).
   protocols are vault-only until the v1.1 shims (SPEC 10); no OAuth, ever
   (static API keys only).
 
+[v1.2.0]: https://github.com/ZN9-KYANT/aivault/compare/v1.1.0...v1.2.0
 [v1.1.0]: https://github.com/ZN9-KYANT/aivault/compare/v1.0.1...v1.1.0
 [v1.0.1]: https://github.com/ZN9-KYANT/aivault/compare/v1.0.0...v1.0.1
 [v1.0.0]: https://github.com/ZN9-KYANT/aivault/releases/tag/v1.0.0

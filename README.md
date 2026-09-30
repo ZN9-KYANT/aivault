@@ -80,7 +80,7 @@ aivault lock
 ## CLI reference
 
 Global flag: `--home <dir>` overrides the `~/.aivault` home (used for tests).
-Current release: **v1.1.0** — print with `aivault version` (or `aivault --version`).
+Current release: **v1.2.0** — print with `aivault version` (or `aivault --version`).
 Secrets are only ever accepted via hidden prompt, `--key-stdin`, or
 `$AIVAULT_<PROVIDER>_KEY` (uppercase provider id, prints a warning) — never as
 a command-line argument.
@@ -200,6 +200,10 @@ uses the backup's passphrase. Audited events: `unlock`, `lock`, `key.add`,
 `key.remove`, `key.rotate`, `key.use`, `proxykey.create`, `provider.add`,
 `passwd`, `auth.fail`.
 
+Run `aivault doctor` for a one-command health report (config, meta/file
+agreement, permissions, proxy keys, audit chain, key ages, live gateway —
+no unlock needed; `FAIL` findings exit non-zero).
+
 ## Gateway API
 
 Base URL: `http://127.0.0.1:8317` (loopback-only; TLS for non-loopback binds is
@@ -259,6 +263,8 @@ port = 8317
 auto_lock_minutes = 15
 failover = false          # retry next alias chain entry on 429/5xx/timeout
 key_max_age_days = 90     # warn in status when a stored key is older (0 = off)
+egress_allowlist = true   # pin upstream dials to registered provider hosts
+auth_max_failures = 20    # per-IP auth-failure rate limit on the data plane (0 = off)
 
 [spend]                   # cost estimation for proxy-key spend caps
 input_usd_per_1m = 0.5
@@ -290,6 +296,13 @@ aivault — don't edit it by hand.
 - `.gitignore` blocks `*.age`, `*.key`, `.env`. OAuth is intentionally
   unsupported (static API keys only).
 - Core dumps disabled at serve startup (unix `RLIMIT_CORE=0`).
+- **Egress allowlist** — upstream connections are pinned (dial-level, redirects
+  re-validated) to the hostnames of registered providers; a tampered config
+  cannot exfiltrate live keys to a rogue server. `egress_allowlist = true` (default).
+- **Startup permission verification** — `serve`/`unlock`/`doctor` refuse to run
+  when vault files carry group/world permissions (POSIX; no-op on Windows).
+- **Brute-force guard** — failed data-plane authentications per peer IP are
+  windowed; past `auth_max_failures` (default 20/min) further attempts get 429.
 - CI runs gofmt-clean builds, `go vet`, tests, `staticcheck`, `govulncheck`,
   and gitleaks secret scanning.
 
