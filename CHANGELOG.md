@@ -3,6 +3,7 @@
 All notable changes to aivault are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 versions with [SemVer](https://semver.org/) (`aivault version` / `--version`).
+English | [日本語](CHANGELOG.ja.md)
 Japanese version of the docs: [README.ja.md](README.ja.md).
 
 ## [Unreleased]
