@@ -1,6 +1,6 @@
 # aivault
 
-[English](README.md) | [日本語](README.ja.md)
+[English](README.md) | [日本語](README.ja.md) | [Changelog](CHANGELOG.md)
 
 An OpenAI-compatible API gateway with per-provider encrypted credential storage.
 

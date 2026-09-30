@@ -1,6 +1,6 @@
 # aivault
 
-[English](README.md) | [日本語](README.ja.md)
+[English](README.md) | [日本語](README.ja.md) | [Changelog](CHANGELOG.md)
 
 プロバイダーごとの暗号化クレデンシャルストレージを備えた、OpenAI 互換 API ゲートウェイ。
 
