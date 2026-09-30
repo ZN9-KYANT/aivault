@@ -7,7 +7,7 @@ package version
 //
 //	-ldflags "-X github.com/ZN9-KYANT/aivault/internal/version.Version=v1.0.0 \
 //	          -X ...version.Commit=abc1234 -X ...version.Date=2026-09-16"
-var Version = "1.0.1"
+var Version = "1.1.0"
 
 // Build metadata; "none"/"unknown" for plain `go build` output.
 var (

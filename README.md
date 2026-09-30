@@ -80,7 +80,7 @@ aivault lock
 ## CLI reference
 
 Global flag: `--home <dir>` overrides the `~/.aivault` home (used for tests).
-Current release: **v1.0.1** — print with `aivault version` (or `aivault --version`).
+Current release: **v1.1.0** — print with `aivault version` (or `aivault --version`).
 Secrets are only ever accepted via hidden prompt, `--key-stdin`, or
 `$AIVAULT_<PROVIDER>_KEY` (uppercase provider id, prints a warning) — never as
 a command-line argument.
@@ -187,7 +187,12 @@ aivault restore vault-backup.age        # confirm + passphrase; refuses clobbers
 aivault restore vault-backup.age --force
 aivault audit --tail 50                 # append-only audit log (display redacted)
 aivault audit --tail 100 --json         # raw JSONL
+aivault audit --verify                  # check the tamper-evident hash chain
 ```
+
+Audit entries are hash-chained (each ID = SHA-256 of its predecessor plus its
+content): edits or deletions break the chain and `audit --verify` exits
+non-zero. Pre-v1.1 entries are skipped as legacy and the chain starts there.
 
 Backups are encrypted under the master passphrase (verified before writing).
 Restore refuses to clobber existing files without `--force`; the restored vault
@@ -205,7 +210,7 @@ planned — SPEC 8.7). Auth: `Authorization: Bearer vk-…`.
 | `POST /v1/chat/completions` | streaming (SSE, chunk-flushed) + non-streaming |
 | `POST /v1/responses` | OpenAI Responses API passthrough |
 | `POST /v1/embeddings` | |
-| `GET /v1/models` | per-provider catalogs, ids namespaced `provider/model`, 10-min cache (cleared on unlock) |
+| `GET /v1/models` | per-provider catalogs, ids namespaced `provider/model`, 10-min cache (cleared on unlock); gateway **aliases** appear with `owned_by: "alias"`, hidden when outside the proxy key's provider scope |
 
 ```bash
 # non-streaming
@@ -253,6 +258,7 @@ Native anthropic/gemini protocols are not proxied yet (v1.1 shims) and return
 port = 8317
 auto_lock_minutes = 15
 failover = false          # retry next alias chain entry on 429/5xx/timeout
+key_max_age_days = 90     # warn in status when a stored key is older (0 = off)
 
 [spend]                   # cost estimation for proxy-key spend caps
 input_usd_per_1m = 0.5
@@ -283,6 +289,9 @@ aivault — don't edit it by hand.
   buffers; secrets never logged.
 - `.gitignore` blocks `*.age`, `*.key`, `.env`. OAuth is intentionally
   unsupported (static API keys only).
+- Core dumps disabled at serve startup (unix `RLIMIT_CORE=0`).
+- CI runs gofmt-clean builds, `go vet`, tests, `staticcheck`, `govulncheck`,
+  and gitleaks secret scanning.
 
 ## Vault home layout
 

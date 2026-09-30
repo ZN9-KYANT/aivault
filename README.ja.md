@@ -81,7 +81,7 @@ aivault lock
 ## CLI リファレンス
 
 グローバルフラグ: `--home <dir>` で `~/.aivault` の代わりのホームを指定
-(テスト用)。現在のリリース: **v1.0.1** — `aivault version` (または
+(テスト用)。現在のリリース: **v1.1.0** — `aivault version` (または
 `aivault --version`) で表示します。シークレットは隠蔽プロンプト、`--key-stdin`、
 `$AIVAULT_<PROVIDER>_KEY` (大文字のプロバイダー ID、警告を表示) のいずれかで
 のみ受け付けます。**コマンドライン引数では絶対に渡しません。**
@@ -189,7 +189,13 @@ aivault restore vault-backup.age        # 確認 + パスフレーズ。上書�
 aivault restore vault-backup.age --force
 aivault audit --tail 50                 # 追記型監査ログ (表示時に墨消し)
 aivault audit --tail 100 --json         # 生 JSONL
+aivault audit --verify                  # 改ざん検知ハッシュチェーンを検証
 ```
+
+監査エントリはハッシュチェーンで連結されます (各 ID = 直前 ID + 内容の
+SHA-256)。編集や削除でチェーンが切断され、`audit --verify` が非ゼロで
+終了します。v1.1 未満のエントリはレガシーとしてスキップされ、そこから
+チェーンが始まります。
 
 バックアップはマスターパスフレーズで暗号化されます (書き込み前に検証)。
 リストアは `--force` なしでは既存ファイルの上書きを拒否します。リストア後の
@@ -207,7 +213,7 @@ vault はバックアップ時のパスフレーズを使います。監査イ�
 | `POST /v1/chat/completions` | ストリーミング (SSE、チャンクフラッシュ) + 非ストリーミング |
 | `POST /v1/responses` | OpenAI Responses API パススルー |
 | `POST /v1/embeddings` | |
-| `GET /v1/models` | プロバイダーごとのカタログ。ID は `provider/model` 形式。10 分キャッシュ (アンロック時にクリア) |
+| `GET /v1/models` | プロバイダーごとのカタログ。ID は `provider/model` 形式。10 分キャッシュ (アンロック時にクリア)。ゲートウェイの**エイリアス**も `owned_by: "alias"` で表示 — プロキシキーのスコープ外のエイリアスは隠れます |
 
 ```bash
 # 非ストリーミング
@@ -256,6 +262,7 @@ anthropic/gemini プロトコルは未対応 (v1.1 の翻訳シムで対応予�
 port = 8317
 auto_lock_minutes = 15
 failover = false          # 429/5xx/タイムアウト時に次のエイリアスチェーンを試行
+key_max_age_days = 90     # 保存済みキーが古すぎる場合に status で警告 (0 = 無効)
 
 [spend]                   # プロキシキー支出上限のコスト概算
 input_usd_per_1m = 0.5
@@ -286,6 +293,9 @@ aivault が管理するため手動編集しないでください。
   ベストエフォート・ゼロ化。シークレットは決してログに残りません。
 - `.gitignore` が `*.age`、`*.key`、`.env` をブロック。OAuth は意図的に
   非対応 (静的 API キーのみ)。
+- サーバー起動時にコアダンプを無効化 (unix `RLIMIT_CORE=0`)。
+- CI は gofmt クリーンなビルド、`go vet`、テスト、`staticcheck`、
+  `govulncheck`、gitleaks シークレットスキャンを実行します。
 
 ## vault ホームのレイアウト
 
