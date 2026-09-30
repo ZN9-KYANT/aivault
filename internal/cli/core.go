@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -215,6 +216,9 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	fmt.Printf("providers: %d stored (%d enabled)\n", len(meta.Providers), enabled)
+	if cfg.KeyMaxAgeDays > 0 {
+		warnAgedKeys(meta, cfg.KeyMaxAgeDays)
+	}
 
 	// Admin plane (SPEC 4.3, 6.2): live server status when reachable.
 	sock := server.SocketPath(home)
@@ -230,6 +234,24 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 		fmt.Printf("gateway: not running (start: aivault serve — socket %s)\n", sock)
 	}
 	return nil
+}
+
+// warnAgedKeys prints rotation warnings for providers whose stored key is
+// older than maxAgeDays (learned from pi-llm-gateway's SECRETS_MAX_AGE_DAYS).
+func warnAgedKeys(meta *vault.Meta, maxAgeDays int) {
+	cut := time.Now().UTC().AddDate(0, 0, -maxAgeDays)
+	var aged []string
+	for id, pm := range meta.Providers {
+		if pm.Kind == string(vault.KindNone) || pm.UpdatedAt.IsZero() || pm.UpdatedAt.After(cut) {
+			continue
+		}
+		days := int(time.Since(pm.UpdatedAt).Hours() / 24)
+		aged = append(aged, fmt.Sprintf("%s (%d days)", id, days))
+	}
+	sort.Strings(aged)
+	for _, a := range aged {
+		fmt.Printf("warn: key age exceeded (%d days max) — rotate: %s\n", maxAgeDays, a)
+	}
 }
 
 func newPasswdCmd() *cobra.Command {

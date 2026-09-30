@@ -43,22 +43,24 @@ type ModelPrice struct {
 
 // Config mirrors config.toml.
 type Config struct {
-	Server       Server     `toml:"server"`
-	AutoLockMins int        `toml:"auto_lock_minutes"`
-	Failover     bool       `toml:"failover"` // retry next alias chain entry on 429/5xx/timeout (SPEC 6.1, default off)
-	Spend        Spend      `toml:"spend"`
-	KDF          kdf.Params `toml:"kdf"`
-	Verifier     string     `toml:"verifier"` // hex-encoded KEK-wrapped verifier blob (SPEC 4.1)
-	Admin        Admin      `toml:"admin"`
+	Server        Server     `toml:"server"`
+	AutoLockMins  int        `toml:"auto_lock_minutes"`
+	Failover      bool       `toml:"failover"`         // retry next alias chain entry on 429/5xx/timeout (SPEC 6.1, default off)
+	KeyMaxAgeDays int        `toml:"key_max_age_days"` // warn in status past this age (0 = off; learned from pi-llm-gateway)
+	Spend         Spend      `toml:"spend"`
+	KDF           kdf.Params `toml:"kdf"`
+	Verifier      string     `toml:"verifier"` // hex-encoded KEK-wrapped verifier blob (SPEC 4.1)
+	Admin         Admin      `toml:"admin"`
 }
 
 // Default returns the default configuration (SPEC 4.2: 15-minute auto-lock;
 // SPEC 6.1: port 8317).
 func Default() *Config {
 	return &Config{
-		Server:       Server{Port: 8317},
-		AutoLockMins: 15,
-		Spend:        Spend{InputUSDPer1M: 0.5, OutputUSDPer1M: 1.5}, // rough cross-provider default estimate
+		Server:        Server{Port: 8317},
+		AutoLockMins:  15,
+		KeyMaxAgeDays: 90,
+		Spend:         Spend{InputUSDPer1M: 0.5, OutputUSDPer1M: 1.5}, // rough cross-provider default estimate
 	}
 }
 
