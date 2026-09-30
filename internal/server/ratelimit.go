@@ -67,7 +67,7 @@ func (l *limiter) addSpend(id string, usd float64, now time.Time) float64 {
 	if sd.day != day {
 		sd = spendDay{day: day}
 	}
-		sd.usd += usd
+	sd.usd += usd
 	l.spend[id] = sd
 	return sd.usd
 }
