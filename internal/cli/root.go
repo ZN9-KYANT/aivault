@@ -25,7 +25,7 @@ func NewRoot() *cobra.Command {
 	root.AddCommand(
 		newInitCmd(), newServeCmd(), newUnlockCmd(), newLockCmd(), newStatusCmd(), newPasswdCmd(),
 		newKeysCmd(), newProxyKeyCmd(), newProvidersCmd(), newAliasCmd(),
-		newBackupCmd(), newRestoreCmd(), newAuditCmd(), newVersionCmd(),
+		newBackupCmd(), newRestoreCmd(), newAuditCmd(), newVersionCmd(), newDoctorCmd(),
 	)
 	return root
 }

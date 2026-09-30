@@ -98,17 +98,34 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		cfg.Server.Port = p
 	}
 
+	// Verify file permissions before anything serves (Batch B): the check is
+	// hard on POSIX and a documented no-op on Windows.
+	if err := vault.CheckPerms(home); err != nil {
+		return err
+	}
+
 	opts := server.Options{
-		Home:         home,
-		ConfigPath:   cfgPath,
-		SocketPath:   server.SocketPath(home),
-		Port:         cfg.Server.Port,
-		DataPlane:    true,
-		AutoLockMins: cfg.AutoLockMins,
+		Home:            home,
+		ConfigPath:      cfgPath,
+		SocketPath:      server.SocketPath(home),
+		Port:            cfg.Server.Port,
+		DataPlane:       true,
+		AutoLockMins:    cfg.AutoLockMins,
+		EgressAllowlist: cfg.EgressAllowlist,
+		AuthMaxFailures: cfg.AuthMaxFailures,
 	}
 	fmt.Printf("aivault server: admin socket %s\n", opts.SocketPath)
 	fmt.Printf("auto-lock: %d min idle (0 disables)\n", opts.AutoLockMins)
+	fmt.Printf("egress allowlist: %v (SPEC-safe routing)\n", onOff(opts.EgressAllowlist))
 	return server.New(opts).Run()
+}
+
+// onOff formats a boolean as an on/off banner word.
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 // loadConfigFile loads an explicit config.toml path (serve supports
@@ -135,6 +152,9 @@ func newUnlockCmd() *cobra.Command {
 // holds no unlock state (the peer-UID-checked socket is the transport).
 func runUnlock(cmd *cobra.Command, _ []string) error {
 	home := homeDir(cmd)
+	if err := vault.CheckPerms(home); err != nil {
+		return err
+	}
 	sock := server.SocketPath(home)
 	c := server.NewClient(sock)
 	if _, err := c.Status(); err != nil {
