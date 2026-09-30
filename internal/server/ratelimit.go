@@ -8,11 +8,13 @@ import (
 	"time"
 )
 
-// limiter tracks a rolling request window and daily spend per proxy key.
+// limiter tracks a rolling request window, daily spend per proxy key, and
+// per-peer-IP auth failures (Batch B, learned from pi-llm-gateway).
 type limiter struct {
 	mu    sync.Mutex
 	reqs  map[string][]time.Time
 	spend map[string]spendDay
+	fails map[string][]time.Time
 }
 
 type spendDay struct {
@@ -21,7 +23,7 @@ type spendDay struct {
 }
 
 func newLimiter() *limiter {
-	return &limiter{reqs: map[string][]time.Time{}, spend: map[string]spendDay{}}
+	return &limiter{reqs: map[string][]time.Time{}, spend: map[string]spendDay{}, fails: map[string][]time.Time{}}
 }
 
 // allow admits one request under the per-minute limit (rpm <= 0 = unlimited).
@@ -70,4 +72,42 @@ func (l *limiter) addSpend(id string, usd float64, now time.Time) float64 {
 	sd.usd += usd
 	l.spend[id] = sd
 	return sd.usd
+}
+
+// recordAuthFail adds one failed data-plane authentication for a peer.
+func (l *limiter) recordAuthFail(peer string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	start := now.Add(-time.Minute)
+	kept := l.fails[peer][:0]
+	for _, t := range l.fails[peer] {
+		if t.After(start) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	l.fails[peer] = kept
+}
+
+// authBlocked reports whether the peer has accumulated max failures within
+// the rolling one-minute window (max <= 0 disables). A blocked peer returns
+// the retry-after duration; window content is kept, not reset.
+func (l *limiter) authBlocked(peer string, max int, now time.Time) (bool, time.Duration) {
+	if max <= 0 {
+		return false, 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	start := now.Add(-time.Minute)
+	kept := l.fails[peer][:0]
+	for _, t := range l.fails[peer] {
+		if t.After(start) {
+			kept = append(kept, t)
+		}
+	}
+	l.fails[peer] = kept
+	if len(kept) >= max {
+		return true, time.Minute - now.Sub(kept[0])
+	}
+	return false, 0
 }

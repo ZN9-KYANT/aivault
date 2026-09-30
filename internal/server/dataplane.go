@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -72,11 +73,28 @@ func (s *Server) dataRoutes() http.Handler {
 }
 
 // withProxyKey authenticates the downstream client and enforces the proxy
-// key's rate/spend limits before the handler runs (SPEC 4.4, 8.8).
+// key's rate/spend limits before the handler runs (SPEC 4.4, 8.8). Failed
+// authentications are counted per peer IP; a peer exceeding
+// AuthMaxFailures within one minute receives 429 before further attempts
+// (brute-force guard, Batch B).
 func (s *Server) withProxyKey(next func(http.ResponseWriter, *http.Request, *proxykey.Key)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := time.Now()
+		peer := remoteIP(r)
+		if s.opts.AuthMaxFailures > 0 {
+			if blocked, retry := s.limiter.authBlocked(peer, s.opts.AuthMaxFailures, now); blocked {
+				_ = audit.Log(s.auditLog, audit.Entry{Event: audit.EventAuthFail, Outcome: "backoff (too many auth failures)"})
+				writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error",
+					fmt.Sprintf("too many authentication failures from your address (retry after %.0fs)", retry.Seconds()),
+					"auth_rate_limited")
+				return
+			}
+		}
 		pk, err := s.authProxyKey(r)
 		if err != nil {
+			if s.opts.AuthMaxFailures > 0 && peer != "" {
+				s.limiter.recordAuthFail(peer, now)
+			}
 			id := ""
 			if pk != nil {
 				id = pk.ID
@@ -91,6 +109,15 @@ func (s *Server) withProxyKey(next func(http.ResponseWriter, *http.Request, *pro
 		}
 		next(w, r, pk)
 	})
+}
+
+// remoteIP extracts the peer host from RemoteAddr ("" when unparseable).
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(r.RemoteAddr))
+	}
+	return strings.ToLower(host)
 }
 
 // authProxyKey validates the Authorization header against proxykeys.json

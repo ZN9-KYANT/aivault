@@ -15,6 +15,7 @@ import (
 
 	"github.com/ZN9-KYANT/aivault/internal/audit"
 	"github.com/ZN9-KYANT/aivault/internal/config"
+	"github.com/ZN9-KYANT/aivault/internal/egress"
 	"github.com/ZN9-KYANT/aivault/internal/proxykey"
 	"github.com/ZN9-KYANT/aivault/internal/vault"
 )
@@ -517,6 +518,86 @@ func TestModelsEndpointAliasesScopedOut(t *testing.T) {
 				t.Fatalf("unexpected alias doc %q", d.ID)
 			}
 		}
+	}
+}
+
+func TestAuthBruteForceLimit(t *testing.T) {
+	home, pass, plain := newGateway(t)
+	_ = pass
+	s, dataURL := newStartedGateway(t, home)
+	s.opts.AuthMaxFailures = 20 // explicit for this test (Options default is 0 = off)
+
+	wrongPost := func(key string) int {
+		resp := mustPost(t, dataURL, "/v1/chat/completions", key, `{"model":"mock/mock-small"}`)
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	wrong := "vk-" + strings.Repeat("0", 48)
+	var authFails int
+	for i := 0; i < 30 && wrongPost(wrong) == http.StatusUnauthorized; i++ {
+		authFails++
+	}
+	if authFails != 20 {
+		t.Fatalf("expected exactly 20 authenticated failures before backoff, got %d", authFails)
+	}
+	// Now even the VALID key gets a 429 until the window drains.
+	if code := wrongPost(plain); code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 backoff after limit, got %d", code)
+	}
+	resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+	data, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil || body["error"] == nil {
+		t.Fatalf("429 not OpenAI-shaped: %s", data)
+	}
+}
+
+func TestAuthBruteForceDisabled(t *testing.T) {
+	const wrongCount = 25
+	home, pass, _ := newGateway(t)
+	_ = pass
+	s, dataURL := newStartedGateway(t, home)
+	s.opts.AuthMaxFailures = 0 // guard disabled: unlimited 401s
+
+	wrong := "vk-" + strings.Repeat("9", 48)
+	for i := 0; i < wrongCount; i++ {
+		resp := mustPost(t, dataURL, "/v1/chat/completions", wrong, `{"model":"mock/mock-small"}`)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("with guard disabled, failure %d returned %d", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+}
+
+func TestEgressGuardBlocksUnknownUpstream(t *testing.T) {
+	home, pass, plain := newGateway(t)
+	s, dataURL := startGateway(t, home, pass)
+	s.opts.EgressAllowlist = true
+	s.refreshEgress(nil) // allowlist = mock hosts (127.0.0.1)
+	t.Cleanup(func() { _ = egress.SetAllowlist(nil) })
+
+	// A legit upstream is allowed.
+	resp := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("allowlisted upstream must work, got %d %s", resp.StatusCode, data)
+	}
+	_ = resp.Body.Close()
+
+	// Simulate a tampered route: the allowlist now lacks the target host.
+	if err := egress.SetAllowlist([]string{"forbidden.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	resp2 := mustPost(t, dataURL, "/v1/chat/completions", plain, `{"model":"mock/mock-small"}`)
+	defer resp2.Body.Close()
+	data, _ := io.ReadAll(resp2.Body)
+	if resp2.StatusCode == http.StatusOK {
+		t.Fatalf("egress guard did not block the non-allowlisted upstream: %s", data)
+	}
+	if !strings.Contains(string(data), "non-allowlisted") {
+		t.Fatalf("error should name the egress guard: %s", data)
 	}
 }
 
