@@ -474,6 +474,14 @@ func spendPrice(cfg *config.Spend, model string) (in, out float64) {
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request, pk *proxykey.Key) {
 	s.touch()
+	// Kill switch (SPEC 4.2): /v1/models is the only data-plane route that
+	// can serve without a keyring credential (modelsFor cache); a locked
+	// gateway must answer 503 here like every credential-bearing route,
+	// not an empty 200 list built from a cache fetched pre-lock.
+	if !s.ring.Unlocked() {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "api_error", "gateway is locked — run aivault unlock", "gateway_locked")
+		return
+	}
 	meta, err := vault.NewStore(s.opts.Home).LoadMeta()
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "load meta: "+err.Error(), "internal_error")

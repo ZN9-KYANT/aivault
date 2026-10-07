@@ -359,6 +359,37 @@ func TestUpstreamErrorShapes(t *testing.T) {
 	}
 }
 
+func TestModelsEndpointLockedAfterCache(t *testing.T) {
+	home, pass, plain := newGateway(t)
+	srv, dataURL := startGateway(t, home, pass)
+
+	get := func() (*http.Response, []byte) {
+		req, _ := http.NewRequest("GET", dataURL+"/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, data
+	}
+
+	resp, data := get()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pre-lock models = %d %s", resp.StatusCode, data)
+	}
+
+	srv.lockFor("test-lock")
+
+	// A lock must kill the whole data plane, including the cached
+	// /v1/models catalog (kill-switch bypass regression, M2 acceptance).
+	resp, data = get()
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(data), "gateway is locked") {
+		t.Fatalf("post-lock models = %d %s", resp.StatusCode, data)
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	home, pass, plain := newGateway(t)
 	_, dataURL := startGateway(t, home, pass)

@@ -408,6 +408,10 @@ func (s *Server) lockFor(reason string) {
 	}
 	s.ring.Lock()
 	redact.Reset()
+	// Cached /models lists were fetched under the (now zeroized) keyring;
+	// serving them after a lock keeps the data plane half-alive even though
+	// every credential-bearing route already fails (kill-switch bypass).
+	s.clearModelsCache()
 	if err := audit.Log(s.auditLog, audit.Entry{Event: audit.EventLock, Outcome: reason}); err != nil {
 		fmt.Fprintf(os.Stderr, "server: audit log: %v\n", err)
 	}
