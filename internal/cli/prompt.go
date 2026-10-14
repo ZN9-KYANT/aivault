@@ -30,7 +30,14 @@ func readSecret(prompt string) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read secret: %w", err)
 		}
-		return pw, nil
+		// Windows consoles (ConPTY/mintty) can deliver the Enter keypress as
+		// a trailing \r\n, and stray paste spaces are common. An untrimmed
+		// byte then poisons the stored secret: net/http rejects control
+		// chars in the Authorization header, and a passphrase verifier would
+		// only match on terminals that reproduce the same byte. Trim both
+		// ends IN PLACE — the slice keeps the same backing array, so caller
+		// Zeroize calls still erase the original buffer.
+		return trimSecret(pw), nil
 	}
 	if stdinLine == nil {
 		stdinLine = bufio.NewReader(os.Stdin)
@@ -57,6 +64,28 @@ func readLine(prompt string) (string, error) {
 	}
 	return strings.TrimRight(line, " \t\r\n"), nil
 }
+
+// trimSecret removes spaces, tabs, and line terminators from both ends of
+// a freshly-typed secret, in place — no legit API key or passphrase starts
+// or ends with these bytes.
+func trimSecret(b []byte) []byte {
+	i, j := 0, len(b)
+	for i < j && isTrimByte(b[i]) {
+		i++
+	}
+	for j > i && isTrimByte(b[j-1]) {
+		j--
+	}
+	if i > 0 {
+		n := copy(b, b[i:j])
+		return b[:n]
+	}
+	return b[:j-i]
+}
+
+// isTrimByte reports whether c is whitespace a human never intends to be
+// part of a typed secret.
+func isTrimByte(c byte) bool { return c == ' ' || c == '\t' || c == '\r' || c == '\n' }
 
 // promptNewPassphrase double-prompts and validates the master passphrase
 // (SPEC 4.1: min 12 chars, zxcvhn strength >= 3).
